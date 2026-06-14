@@ -1,6 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { createContext, PropsWithChildren, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import * as Linking from 'expo-linking';
+import { createContext, PropsWithChildren, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import * as WebBrowser from 'expo-web-browser';
 import { applyTheme } from '../theme/tokens';
 import { supabase } from '../lib/supabase';
@@ -390,6 +389,7 @@ export function HealthProvider({ children }: PropsWithChildren) {
   const [state, setState] = useState<HealthState>(initialState);
   const [ready, setReady] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Load health data from AsyncStorage + restore Supabase session on mount
   useEffect(() => {
@@ -490,11 +490,16 @@ export function HealthProvider({ children }: PropsWithChildren) {
     return () => subscription.unsubscribe();
   }, []);
 
-  // Persist health data to AsyncStorage whenever state changes
+  // Persist health data to AsyncStorage — debounced to avoid excessive writes
   useEffect(() => {
-    if (ready) {
+    if (!ready) return;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
       AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(state)).catch(() => undefined);
-    }
+    }, 800);
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
   }, [ready, state]);
 
   const setSeenIntro = useCallback(() => {
@@ -536,37 +541,45 @@ export function HealthProvider({ children }: PropsWithChildren) {
       const redirectTo = 'aurora://auth/callback';
       const { data, error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
-        options: {
-          redirectTo,
-          skipBrowserRedirect: true,
-          queryParams: { access_type: 'offline', prompt: 'consent' },
-        },
+        options: { redirectTo, skipBrowserRedirect: true },
       });
       if (error || !data.url) return error?.message ?? 'Could not start Google sign in';
 
       const result = await WebBrowser.openAuthSessionAsync(data.url, redirectTo);
-      if (result.type !== 'success') return null;
+      if (result.type === 'cancel') return null;
+      if (result.type !== 'success') return 'Google sign in was dismissed';
 
-      // Parse the URL and extract tokens/code
-      const url = result.url;
-      const params = new URLSearchParams(url.includes('#') ? url.split('#')[1] : url.split('?')[1] ?? '');
-      const accessToken  = params.get('access_token');
-      const refreshToken = params.get('refresh_token');
+      const callbackUrl = result.url;
 
-      if (accessToken && refreshToken) {
-        // Implicit flow — set session directly
-        const { error: sessionError } = await supabase.auth.setSession({
-          access_token: accessToken,
-          refresh_token: refreshToken,
-        });
-        if (sessionError) return sessionError.message;
-      } else {
-        // PKCE flow — exchange code
-        const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(url);
-        if (exchangeError) return exchangeError.message;
+      // Try implicit flow first (tokens in URL fragment)
+      const hashFragment = callbackUrl.includes('#') ? callbackUrl.split('#')[1] : null;
+      if (hashFragment) {
+        const params = new URLSearchParams(hashFragment);
+        const accessToken  = params.get('access_token');
+        const refreshToken = params.get('refresh_token');
+        if (accessToken && refreshToken) {
+          const { error: sessionError } = await supabase.auth.setSession({
+            access_token: accessToken,
+            refresh_token: refreshToken,
+          });
+          return sessionError?.message ?? null;
+        }
       }
 
-      return null;
+      // Try PKCE code exchange (code in query string)
+      const queryString = callbackUrl.includes('?') ? callbackUrl.split('?')[1] : null;
+      if (queryString) {
+        const params = new URLSearchParams(queryString);
+        const code = params.get('code');
+        if (code) {
+          const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(callbackUrl);
+          return exchangeError?.message ?? null;
+        }
+      }
+
+      return 'Could not complete Google sign in — no tokens in response';
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Unexpected error during Google sign in';
     } finally {
       setAuthLoading(false);
     }
@@ -590,10 +603,10 @@ export function HealthProvider({ children }: PropsWithChildren) {
           id: user.id,
           email: user.email ?? '',
           ...(profile.name !== undefined && { name: profile.name }),
-          ...(profile.age !== undefined && { age: parseInt(profile.age) || null }),
+          ...(profile.age !== undefined && { age: Number.isFinite(parseInt(profile.age)) ? parseInt(profile.age) : null }),
           ...(profile.gender !== undefined && { gender: profile.gender }),
-          ...(profile.heightCm !== undefined && { height_cm: parseFloat(profile.heightCm) || null }),
-          ...(profile.weightKg !== undefined && { weight_kg: parseFloat(profile.weightKg) || null }),
+          ...(profile.heightCm !== undefined && { height_cm: Number.isFinite(parseFloat(profile.heightCm)) ? parseFloat(profile.heightCm) : null }),
+          ...(profile.weightKg !== undefined && { weight_kg: Number.isFinite(parseFloat(profile.weightKg)) ? parseFloat(profile.weightKg) : null }),
           ...(profile.wakeTime !== undefined && { wake_time: profile.wakeTime + ':00' }),
           ...(profile.bedtime !== undefined && { bedtime: profile.bedtime + ':00' }),
           ...(profile.activityLevel !== undefined && { activity_level: profile.activityLevel }),
@@ -754,14 +767,15 @@ export function HealthProvider({ children }: PropsWithChildren) {
   }, [syncWater]);
 
   const setHydrationGoal = useCallback((goalMl: number) => {
+    const safe = Number.isFinite(goalMl) ? goalMl : 2000;
     setState((current) => ({
       ...current,
-      hydration: { ...current.hydration, goalMl: Math.max(500, Math.min(5000, goalMl)) },
+      hydration: { ...current.hydration, goalMl: Math.max(500, Math.min(5000, safe)) },
     }));
   }, []);
 
   const logSleep = useCallback((hours: number, bedtime?: string, wakeTime?: string) => {
-    const cleanHours = Math.max(0, Math.min(16, Number(hours.toFixed(1))));
+    const cleanHours = Number.isFinite(hours) ? Math.max(0, Math.min(16, Number(hours.toFixed(1)))) : 0;
     if (!cleanHours) return;
     Promise.resolve().then(() => syncSleep(cleanHours, bedtime, wakeTime));
     setState((current) => {

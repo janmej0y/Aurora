@@ -229,9 +229,11 @@ function useNativeVoiceRecorder(onAutoStop: (uri: string | null) => void) {
         const ok = await requestPermission();
         if (!ok) return false;
       } else if (!permissionGranted) {
-        return false;
+        const ok = await requestPermission();
+        if (!ok) return false;
       }
 
+      clearTimers();
       autoStoppedRef.current = false;
       await audioRecorder.prepareToRecordAsync();
       audioRecorder.record();

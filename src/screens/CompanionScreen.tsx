@@ -508,7 +508,20 @@ export function CompanionScreen() {
     try {
       const res = await sendAgentVoice(uri, state);
 
-      if (res.error === 'no_audio' || res.error === 'no_transcript' || (!res.transcript && !res.reply)) {
+      if (res.error === 'no_audio') {
+        // Audio never arrived — silent fail, don't show error message
+        setVoiceMode(false); setBusy(false); setUiStatus('idle');
+        return;
+      }
+      if (res.error === 'no_transcript' || res.error === 'unclear') {
+        // Mic picked up nothing useful — prompt user to try again
+        setVoiceMode(false); setBusy(false); setUiStatus('idle');
+        const msg = "I didn't catch that. Try speaking a bit louder or tap the mic again.";
+        addChatMessage({ role: 'assistant', content: msg });
+        speak(msg);
+        return;
+      }
+      if (!res.transcript && !res.reply) {
         setVoiceMode(false); setBusy(false); setUiStatus('idle');
         return;
       }

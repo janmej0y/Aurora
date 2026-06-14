@@ -38,9 +38,16 @@ const uploadDir = path.join(__dirname, 'uploads');
 
 fs.mkdirSync(uploadDir, { recursive: true });
 
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, uploadDir),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname) || '.m4a';
+    cb(null, `aurora-${Date.now()}${ext}`);
+  },
+});
 const upload = multer({
-  dest:   uploadDir,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 },
 });
 
 app.use(cors());
@@ -509,7 +516,16 @@ async function transcribeAudio(filePath, mimeType) {
   if (DEEPGRAM_API_KEY) {
     try {
       const audioBuffer = fs.readFileSync(filePath);
-      const contentType = mimeType || 'audio/m4a';
+
+      // Derive content-type from file extension — multer's mimetype is unreliable for native uploads
+      const ext = path.extname(filePath).toLowerCase();
+      const contentType = ext === '.webm' ? 'audio/webm'
+                        : ext === '.wav'  ? 'audio/wav'
+                        : ext === '.ogg'  ? 'audio/ogg'
+                        : ext === '.mp4'  ? 'audio/mp4'
+                        : ext === '.mp3'  ? 'audio/mp3'
+                        : mimeType && mimeType !== 'application/octet-stream' ? mimeType
+                        : 'audio/m4a'; // default for iOS/Android expo-audio
 
       const dgRes = await fetch(
         'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&language=en-US&punctuate=true',
@@ -553,9 +569,10 @@ function checkTranscriptQuality(transcript, confidence) {
   }
 
   const words   = trimmed.split(/\s+/).filter(Boolean);
-  const fillers = new Set(['um', 'uh', 'hmm', 'ah', 'oh', 'hello', 'hi', 'hey']);
+  // Only reject pure noise — don't filter greetings like hello/hi/hey (they start valid conversations)
+  const fillers = new Set(['um', 'uh', 'hmm', 'ah']);
 
-  if (words.length <= 2 && words.every(w => fillers.has(w.toLowerCase()))) {
+  if (words.length === 1 && fillers.has(words[0].toLowerCase())) {
     return { pass: false, error: 'unclear', transcript: trimmed };
   }
 

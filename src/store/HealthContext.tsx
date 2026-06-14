@@ -533,21 +533,39 @@ export function HealthProvider({ children }: PropsWithChildren) {
   const signInWithGoogle = useCallback(async (): Promise<string | null> => {
     setAuthLoading(true);
     try {
-      // Use the deep-link scheme so Android redirects back to the app, not localhost
       const redirectTo = 'aurora://auth/callback';
       const { data, error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
-        options: { redirectTo, skipBrowserRedirect: true },
+        options: {
+          redirectTo,
+          skipBrowserRedirect: true,
+          queryParams: { access_type: 'offline', prompt: 'consent' },
+        },
       });
       if (error || !data.url) return error?.message ?? 'Could not start Google sign in';
 
       const result = await WebBrowser.openAuthSessionAsync(data.url, redirectTo);
-      if (result.type === 'success') {
-        const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(result.url);
+      if (result.type !== 'success') return null;
+
+      // Parse the URL and extract tokens/code
+      const url = result.url;
+      const params = new URLSearchParams(url.includes('#') ? url.split('#')[1] : url.split('?')[1] ?? '');
+      const accessToken  = params.get('access_token');
+      const refreshToken = params.get('refresh_token');
+
+      if (accessToken && refreshToken) {
+        // Implicit flow — set session directly
+        const { error: sessionError } = await supabase.auth.setSession({
+          access_token: accessToken,
+          refresh_token: refreshToken,
+        });
+        if (sessionError) return sessionError.message;
+      } else {
+        // PKCE flow — exchange code
+        const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(url);
         if (exchangeError) return exchangeError.message;
-      } else if (result.type === 'cancel') {
-        return null;
       }
+
       return null;
     } finally {
       setAuthLoading(false);

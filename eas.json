@@ -17,7 +17,7 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://your-render-url.onrender.com",
+        "EXPO_PUBLIC_API_URL": "https://aurora-api-lo5b.onrender.com",
         "EXPO_PUBLIC_SUPABASE_URL": "https://uzvciodhxwrtwtvuwuoc.supabase.co",
         "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_oUy3VBM9dj9SklBJCke49w_zYke2TKS"
       }
@@ -27,7 +27,7 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://your-render-url.onrender.com",
+        "EXPO_PUBLIC_API_URL": "https://aurora-api-lo5b.onrender.com",
         "EXPO_PUBLIC_SUPABASE_URL": "https://uzvciodhxwrtwtvuwuoc.supabase.co",
         "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_oUy3VBM9dj9SklBJCke49w_zYke2TKS"
       }

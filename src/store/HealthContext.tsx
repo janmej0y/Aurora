@@ -678,7 +678,10 @@ export function HealthProvider({ children }: PropsWithChildren) {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
       await supabase.from('sleep_logs').upsert({
-        user_id: user.id, hours, bedtime: bedtime || null, wake_time: wakeTime || null,
+        user_id: user.id,
+        hours,
+        bedtime:    bedtime   || '22:30:00',
+        wake_time:  wakeTime  || '06:30:00',
         logged_date: todayKey(),
       }, { onConflict: 'user_id,logged_date' });
     } catch { /* non-critical */ }
@@ -711,10 +714,17 @@ export function HealthProvider({ children }: PropsWithChildren) {
         { habit_id: sbHabitId, logged_date: todayKey(), status: 'completed' },
         { onConflict: 'habit_id,logged_date' }
       );
-      try {
-        await supabase.rpc('increment_habit_streak', { p_habit_id: sbHabitId });
-      } catch {
-        await supabase.from('habits').update({ streak: 1 }).eq('id', sbHabitId);
+      // increment_habit_streak RPC not defined in schema — increment directly
+      const { data: habitRow } = await supabase
+        .from('habits')
+        .select('streak')
+        .eq('id', sbHabitId)
+        .single();
+      if (habitRow) {
+        await supabase
+          .from('habits')
+          .update({ streak: (habitRow.streak || 0) + 1 })
+          .eq('id', sbHabitId);
       }
     } catch { /* non-critical */ }
   }, []);
@@ -727,10 +737,10 @@ export function HealthProvider({ children }: PropsWithChildren) {
         user_id: user.id,
         meal_type: meal.type,
         name: meal.name,
-        calories: meal.calories,
-        protein_grams: meal.protein,
-        carbs_grams: meal.carbs,
-        fat_grams: meal.fat,
+        calories:      Number(meal.calories) || 0,
+        protein_grams: Number(meal.protein)  || 0,
+        carbs_grams:   Number(meal.carbs)    || 0,
+        fat_grams:     Number(meal.fat)      || 0,
         logged_date: todayKey(),
       });
     } catch { /* non-critical */ }
@@ -905,12 +915,84 @@ export function HealthProvider({ children }: PropsWithChildren) {
     }));
   }, []);
 
+  // applyAgentActions updates LOCAL STATE ONLY — the server already wrote to Supabase.
+  // Calling addWater/addMeal/etc. here would trigger their syncX() functions and create
+  // duplicate rows in the database.
   const applyAgentActions = useCallback(
     (actions: AgentAction[]) => {
       actions.forEach((action) => {
-        if (action.type === 'ADD_WATER') addWater(action.amountMl);
-        if (action.type === 'LOG_SLEEP') logSleep(action.hours, action.bedtime, action.wakeTime);
-        if (action.type === 'CREATE_HABIT') createHabit(action.title, action.period, action.cadence);
+        if (action.type === 'ADD_WATER') {
+          const cleanAmount = Math.max(0, Math.round(action.amountMl));
+          if (!cleanAmount) return;
+          setState((current) => {
+            const today = todayKey();
+            const history = current.hydration.history.some((item) => item.date === today)
+              ? current.hydration.history.map((item) =>
+                  item.date === today ? { ...item, amountMl: item.amountMl + cleanAmount } : item,
+                )
+              : [{ date: today, amountMl: cleanAmount }, ...current.hydration.history].slice(0, 30);
+            return {
+              ...current,
+              hydration: {
+                ...current.hydration,
+                currentMl: current.hydration.currentMl + cleanAmount,
+                history,
+              },
+            };
+          });
+        }
+
+        if (action.type === 'LOG_SLEEP') {
+          const cleanHours = Number.isFinite(action.hours) ? Math.max(0, Math.min(16, Number(Number(action.hours).toFixed(1)))) : 0;
+          if (cleanHours) {
+            setState((current) => {
+              const entry = {
+                id: makeId('sleep'),
+                date: todayKey(),
+                hours: cleanHours,
+                bedtime: action.bedtime || current.user.bedtime || '22:30',
+                wakeTime: action.wakeTime || current.user.wakeTime || '06:30',
+                quality: (cleanHours >= 7.5 ? 'Excellent' : cleanHours >= 6.5 ? 'Good' : cleanHours >= 5.5 ? 'Fair' : 'Poor') as 'Excellent' | 'Good' | 'Fair' | 'Poor',
+                stages: {
+                  rem: Number((cleanHours * 0.21).toFixed(1)),
+                  light: Number((cleanHours * 0.52).toFixed(1)),
+                  deep: Number((cleanHours * 0.22).toFixed(1)),
+                  awake: Number((cleanHours * 0.05).toFixed(1)),
+                },
+              };
+              const logs = [entry, ...current.sleep.logs.filter((l) => l.date !== entry.date)].slice(0, 30);
+              return { ...current, sleep: { ...current.sleep, ...recalculateSleep(logs), logs } };
+            });
+          }
+        }
+
+        if (action.type === 'CREATE_HABIT') {
+          const trimmed = (action.title || '').trim();
+          if (!trimmed) return;
+          const { period = 'Anytime', cadence = 'Daily' } = action;
+          const HABIT_COLORS = ['#00D97E', '#3B9EFF', '#8B7BFF', '#FFB547', '#FF6B6B'];
+          setState((current) => ({
+            ...current,
+            habits: [
+              {
+                id: makeId('habit'),
+                title: trimmed,
+                completionDates: [],
+                period,
+                cadence,
+                streak: 0,
+                longestStreak: 0,
+                completedToday: false,
+                paused: false,
+                skippedToday: false,
+                emoji: '⭐',
+                color: HABIT_COLORS[current.habits.length % HABIT_COLORS.length],
+              },
+              ...current.habits,
+            ],
+          }));
+        }
+
         if (action.type === 'COMPLETE_HABIT') {
           const today = todayKey();
           setState((current) => {
@@ -936,32 +1018,44 @@ export function HealthProvider({ children }: PropsWithChildren) {
             };
           });
         }
+
         if (action.type === 'ADD_MEAL') {
-          addMeal({
-            type: action.mealType,
-            name: action.name,
-            calories: action.calories ?? 0,
-            protein: action.protein ?? 0,
-            carbs: action.carbs ?? 0,
-            fat: action.fat ?? 0,
-          });
+          setState((current) => ({
+            ...current,
+            meals: [
+              {
+                id: makeId('meal'),
+                date: todayKey(),
+                type: action.mealType,
+                name: action.name,
+                calories: action.calories ?? 0,
+                protein: action.protein ?? 0,
+                carbs: action.carbs ?? 0,
+                fat: action.fat ?? 0,
+              },
+              ...current.meals,
+            ].slice(0, 60),
+          }));
         }
+
         if (action.type === 'SET_HYDRATION_GOAL') {
           setState((current) => ({
             ...current,
             hydration: { ...current.hydration, goalMl: action.goalMl },
           }));
         }
+
         if (action.type === 'ADD_MEMORY') {
           setState((current) => ({
             ...current,
             memories: [action.text, ...current.memories.filter((m) => m !== action.text)].slice(0, 10),
           }));
+          // Memory is the only action the server doesn't write — sync it now
           Promise.resolve().then(() => syncMemory(action.text));
         }
       });
     },
-    [addMeal, addWater, createHabit, logSleep, syncMemory],
+    [syncMemory],
   );
 
   const resetDemo = useCallback(() => {

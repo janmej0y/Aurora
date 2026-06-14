@@ -127,8 +127,8 @@ async function logSleep(userId, hours, bedtime, wakeTime) {
         {
           user_id:     userId,
           hours,
-          bedtime:     bedtime  || null,
-          wake_time:   wakeTime || null,
+          bedtime:     bedtime   || '22:30:00',
+          wake_time:   wakeTime  || '06:30:00',
           logged_date: loggedDate,
         },
         { onConflict: 'user_id,logged_date' }
@@ -233,10 +233,10 @@ async function logMeal(userId, mealType, name, calories, protein, carbs, fat) {
         user_id:       userId,
         meal_type:     mealType,
         name,
-        calories:      calories || null,
-        protein_grams: protein  || null,
-        carbs_grams:   carbs    || null,
-        fat_grams:     fat      || null,
+        calories:      Number(calories) || 0,
+        protein_grams: Number(protein)  || 0,
+        carbs_grams:   Number(carbs)    || 0,
+        fat_grams:     Number(fat)      || 0,
         logged_date:   today(),
       })
       .select()
@@ -320,7 +320,11 @@ async function getHealthSummary(userId) {
     // Hydration
     const totalMl = (hydResult.data || []).reduce((s, r) => s + (r.amount_ml || 0), 0);
     const profile  = profileResult.data || {};
-    const goalMl   = profile.goal_ml || 2500;
+    // profiles table has no goal_ml column — derive from activity_level
+    const goalMl = profile.activity_level === 'Athlete'  ? 3500
+                 : profile.activity_level === 'Active'   ? 3000
+                 : profile.activity_level === 'Moderate' ? 2500
+                 : 2000; // Light
 
     // Sleep (prefer today, fall back to yesterday)
     const sleepData = sleepTodayResult.data || sleepYestResult.data || null;
@@ -381,6 +385,14 @@ async function getWeeklyReport(userId) {
     startDate.setDate(startDate.getDate() - 6);
     const startStr  = startDate.toISOString().slice(0, 10);
 
+    // Get user's habit IDs first (can't filter habit_logs by user_id directly)
+    const { data: userHabits } = await supabase
+      .from('habits')
+      .select('id')
+      .eq('user_id', userId);
+
+    const habitIds = (userHabits || []).map(h => h.id);
+
     const [hydResult, sleepResult, habitLogsResult] = await Promise.all([
       supabase
         .from('hydration_logs')
@@ -396,13 +408,14 @@ async function getWeeklyReport(userId) {
         .gte('logged_date', startStr)
         .lte('logged_date', endDate),
 
-      // habit_logs don't filter by user_id directly — join via habit_id
-      supabase
-        .from('habit_logs')
-        .select('habit_id, logged_date, status, habits!inner(user_id)')
-        .eq('habits.user_id', userId)
-        .gte('logged_date', startStr)
-        .lte('logged_date', endDate),
+      habitIds.length > 0
+        ? supabase
+            .from('habit_logs')
+            .select('habit_id, logged_date, status')
+            .in('habit_id', habitIds)
+            .gte('logged_date', startStr)
+            .lte('logged_date', endDate)
+        : Promise.resolve({ data: [] }),
     ]);
 
     // Group hydration by date
@@ -702,8 +715,8 @@ async function executeIntent(intent, params, userId) {
   const actionsExecuted = [];
   let toolResult        = null;
 
-  if (!userId) {
-    // Guest mode — skip all DB ops
+  if (!userId || userId === 'null' || userId === 'undefined') {
+    // Guest / unauthenticated mode — skip all DB ops
     return { toolResult: null, actionsExecuted };
   }
 
@@ -801,8 +814,11 @@ async function executeIntent(intent, params, userId) {
 // ═══════════════════════════════════════════════════════════════════
 
 function buildResponseSystemPrompt(profile, memories) {
-  const name    = profile?.full_name || profile?.name || 'there';
-  const goalMl  = profile?.goal_ml   || 2500;
+  const name   = profile?.full_name || profile?.name || 'there';
+  const goalMl = profile?.activity_level === 'Athlete'  ? 3500
+               : profile?.activity_level === 'Active'   ? 3000
+               : profile?.activity_level === 'Moderate' ? 2500
+               : 2000;
   const memText = (memories || []).slice(0, 8).join('\n  - ') || 'none yet';
 
   return `You are Aurora, a warm and knowledgeable AI health companion. You have just executed a health action or retrieved health data for the user.
@@ -1087,10 +1103,14 @@ async function runAgentPipeline(message, userId, context, chatHistory) {
     }
 
     // Auto-persist a memory when the user hits their hydration goal
+    const profileGoalMl = profile?.activity_level === 'Athlete'  ? 3500
+                        : profile?.activity_level === 'Active'   ? 3000
+                        : profile?.activity_level === 'Moderate' ? 2500
+                        : 2000;
     if (
       intent === 'log_water' &&
       toolResult?.success &&
-      toolResult.totalMl >= (profile?.goal_ml || 2500)
+      toolResult.totalMl >= profileGoalMl
     ) {
       await saveMemory(
         userId,

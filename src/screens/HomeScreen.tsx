@@ -72,18 +72,18 @@ function AnimatedHealthRing({
     return () => { beat.stop(); glow.stop(); };
   }, []);
 
-  // ECG dash animation — cycle the stroke-dashoffset to create a "travelling pulse" effect
-  const [ecgOffset, setEcgOffset] = useState(40);
+  // ECG dash animation — Animated value to avoid setState on every frame
+  const ecgAnim = useRef(new Animated.Value(40)).current;
   useEffect(() => {
-    let frame: ReturnType<typeof setTimeout>;
-    let val = 40;
-    const tick = () => {
-      val = val <= -40 ? 40 : val - 1.8;
-      setEcgOffset(val);
-      frame = setTimeout(tick, 30);
-    };
-    frame = setTimeout(tick, 30);
-    return () => clearTimeout(frame);
+    const ecg = Animated.loop(
+      Animated.timing(ecgAnim, {
+        toValue: -40,
+        duration: 1320,
+        useNativeDriver: false,
+      })
+    );
+    ecg.start();
+    return () => ecg.stop();
   }, []);
 
   // Derive glow color from score
@@ -161,7 +161,7 @@ function AnimatedHealthRing({
             strokeLinecap="round"
             strokeLinejoin="round"
             strokeDasharray="14 26"
-            strokeDashoffset={ecgOffset}
+            strokeDashoffset={ecgAnim as unknown as number}
             opacity={0.95}
           />
 

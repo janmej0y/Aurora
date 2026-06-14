@@ -1,126 +1,314 @@
-import { useRef } from 'react';
-import { StyleSheet, Text, TouchableOpacity, View, Dimensions } from 'react-native';
+import { useRef, useState } from 'react';
+import {
+  Animated,
+  Dimensions,
+  FlatList,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+  ViewToken,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import Svg, { Circle, Defs, LinearGradient, Stop, Path, G, Rect } from 'react-native-svg';
-import { colors, fontWeight, radius, shadow, spacing, type } from '../theme/tokens';
-import { useHealth } from '../store/HealthContext';
+import Svg, {
+  Circle,
+  Defs,
+  LinearGradient,
+  Path,
+  Rect,
+  Stop,
+} from 'react-native-svg';
+import { Droplets, BedDouble, Sparkles, TrendingUp, Brain } from 'lucide-react-native';
 
-const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
+import { useHealth } from '../store/HealthContext';
+import { colors, fontWeight, radius, spacing, type } from '../theme/tokens';
+
+const { width: W, height: H } = Dimensions.get('window');
+
+type Slide = {
+  id: string;
+  eyebrow: string;
+  title: string;
+  subtitle: string;
+  accent: string;
+  icon: typeof Droplets;
+};
+
+const SLIDES: Slide[] = [
+  {
+    id: 'hero',
+    eyebrow: 'AURORA',
+    title: 'Understand yourself\nbetter every day.',
+    subtitle: 'Your personal AI health companion. Built around your life.',
+    accent: '#10B981',
+    icon: Sparkles,
+  },
+  {
+    id: 'companion',
+    eyebrow: 'MEET AURORA',
+    title: 'Your personal\nhealth companion.',
+    subtitle: 'Aurora learns your patterns and coaches you with warmth, not pressure.',
+    accent: '#06B6D4',
+    icon: Brain,
+  },
+  {
+    id: 'track',
+    eyebrow: 'EFFORTLESS TRACKING',
+    title: 'Track hydration,\nsleep, habits,\nand nutrition.',
+    subtitle: 'Just speak naturally. Aurora logs it for you in seconds.',
+    accent: '#8B5CF6',
+    icon: Droplets,
+  },
+  {
+    id: 'insights',
+    eyebrow: 'DAILY INSIGHTS',
+    title: 'Receive personalized\ndaily insights.',
+    subtitle: "Spot trends you'd never notice. Aurora connects the dots across all your data.",
+    accent: '#F59E0B',
+    icon: TrendingUp,
+  },
+  {
+    id: 'habits',
+    eyebrow: 'BUILD CONSISTENCY',
+    title: 'Build healthier\nroutines through\nconsistency.',
+    subtitle: 'Small wins compound. Aurora celebrates every step and keeps you on track.',
+    accent: '#EC4899',
+    icon: BedDouble,
+  },
+];
+
+function SlideBackground({ accent }: { accent: string }) {
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      <Svg width={W} height={H} viewBox={`0 0 ${W} ${H}`}>
+        <Defs>
+          <LinearGradient id="sky" x1="0%" y1="0%" x2="0%" y2="100%">
+            <Stop offset="0%" stopColor="#06080F" />
+            <Stop offset="55%" stopColor="#0C1220" />
+            <Stop offset="100%" stopColor="#060810" />
+          </LinearGradient>
+          <LinearGradient id="glow" x1="0%" y1="0%" x2="100%" y2="100%">
+            <Stop offset="0%" stopColor={accent} stopOpacity="0.0" />
+            <Stop offset="50%" stopColor={accent} stopOpacity="0.12" />
+            <Stop offset="100%" stopColor={accent} stopOpacity="0.0" />
+          </LinearGradient>
+        </Defs>
+        <Rect width={W} height={H} fill="url(#sky)" />
+        {/* Ambient glow from top-right */}
+        <Circle cx={W * 0.8} cy={H * 0.15} r={W * 0.65} fill={accent} opacity={0.06} />
+        {/* Mountain silhouettes */}
+        <Path
+          d={`M0 ${H * 0.82} L${W * 0.22} ${H * 0.68} L${W * 0.5} ${H * 0.76} L${W * 0.78} ${H * 0.64} L${W} ${H * 0.74} L${W} ${H} L0 ${H} Z`}
+          fill="#05080E"
+        />
+        <Path
+          d={`M0 ${H * 0.87} L${W * 0.32} ${H * 0.76} L${W * 0.65} ${H * 0.81} L${W} ${H * 0.73} L${W} ${H} L0 ${H} Z`}
+          fill="#030508"
+          opacity={0.9}
+        />
+      </Svg>
+    </View>
+  );
+}
+
+function SlideOrb({ accent, icon: Icon }: { accent: string; icon: typeof Droplets }) {
+  return (
+    <View style={orbStyles.wrap}>
+      {/* Outer glow rings */}
+      <View style={[orbStyles.ring3, { borderColor: `${accent}18` }]} />
+      <View style={[orbStyles.ring2, { borderColor: `${accent}28` }]} />
+      <View style={[orbStyles.ring1, { borderColor: `${accent}40` }]} />
+      {/* Core circle */}
+      <View style={[orbStyles.core, { backgroundColor: `${accent}18`, borderColor: `${accent}60` }]}>
+        <Icon size={32} color={accent} strokeWidth={1.8} />
+      </View>
+    </View>
+  );
+}
+
+const orbStyles = StyleSheet.create({
+  wrap: {
+    width: 160,
+    height: 160,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  ring3: {
+    position: 'absolute',
+    width: 160,
+    height: 160,
+    borderRadius: 80,
+    borderWidth: 1,
+  },
+  ring2: {
+    position: 'absolute',
+    width: 124,
+    height: 124,
+    borderRadius: 62,
+    borderWidth: 1,
+  },
+  ring1: {
+    position: 'absolute',
+    width: 94,
+    height: 94,
+    borderRadius: 47,
+    borderWidth: 1.5,
+  },
+  core: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    borderWidth: 1.5,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+});
+
+function SlideItem({ item }: { item: Slide }) {
+  return (
+    <View style={[slideStyles.slide, { width: W }]}>
+      <SlideBackground accent={item.accent} />
+
+      <View style={slideStyles.content}>
+        <SlideOrb accent={item.accent} icon={item.icon} />
+
+        <View style={slideStyles.text}>
+          <Text style={[slideStyles.eyebrow, { color: item.accent }]}>{item.eyebrow}</Text>
+          <Text style={slideStyles.title}>{item.title}</Text>
+          <Text style={slideStyles.subtitle}>{item.subtitle}</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const slideStyles = StyleSheet.create({
+  slide: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  content: {
+    alignItems: 'center',
+    gap: spacing.xxxl,
+    paddingHorizontal: spacing.xxl,
+    paddingBottom: H * 0.18,
+  },
+  text: {
+    alignItems: 'center',
+    gap: spacing.md,
+  },
+  eyebrow: {
+    fontSize: type.micro ?? 11,
+    fontWeight: fontWeight.black,
+    letterSpacing: 4,
+    textTransform: 'uppercase',
+  },
+  title: {
+    color: '#F1F5F9',
+    fontSize: type.display + 4,
+    fontWeight: fontWeight.black,
+    lineHeight: 42,
+    textAlign: 'center',
+    letterSpacing: -0.5,
+  },
+  subtitle: {
+    color: '#94A3B8',
+    fontSize: type.body,
+    lineHeight: 26,
+    textAlign: 'center',
+    fontWeight: fontWeight.medium,
+    maxWidth: 300,
+  },
+});
+
+function Dots({ count, active, accent }: { count: number; active: number; accent: string }) {
+  return (
+    <View style={dotStyles.row}>
+      {Array.from({ length: count }).map((_, i) => (
+        <View
+          key={i}
+          style={[
+            dotStyles.dot,
+            i === active
+              ? { width: 20, backgroundColor: accent }
+              : { width: 6, backgroundColor: '#2A3347' },
+          ]}
+        />
+      ))}
+    </View>
+  );
+}
+
+const dotStyles = StyleSheet.create({
+  row: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  dot: {
+    height: 6,
+    borderRadius: 3,
+  },
+});
 
 export function IntroScreen() {
   const { setSeenIntro } = useHealth();
+  const [activeIndex, setActiveIndex] = useState(0);
+  const listRef = useRef<FlatList>(null);
+
+  const isLast = activeIndex === SLIDES.length - 1;
+  const activeSlide = SLIDES[activeIndex];
+
+  const onViewableItemsChanged = useRef(({ viewableItems }: { viewableItems: ViewToken[] }) => {
+    if (viewableItems[0]?.index != null) {
+      setActiveIndex(viewableItems[0].index);
+    }
+  }).current;
+
+  const goNext = () => {
+    if (isLast) {
+      setSeenIntro();
+    } else {
+      listRef.current?.scrollToIndex({ index: activeIndex + 1, animated: true });
+    }
+  };
+
+  const skip = () => setSeenIntro();
 
   return (
     <SafeAreaView style={introStyles.screen}>
-      {/* Dynamic Aurora Sky and Mountains background via SVG */}
-      <View style={StyleSheet.absoluteFill}>
-        <Svg width={SCREEN_WIDTH} height={SCREEN_HEIGHT} viewBox={`0 0 ${SCREEN_WIDTH} ${SCREEN_HEIGHT}`}>
-          <Defs>
-            {/* Sky Gradient */}
-            <LinearGradient id="skyGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-              <Stop offset="0%" stopColor="#080B11" />
-              <Stop offset="60%" stopColor="#0E1726" />
-              <Stop offset="100%" stopColor="#080C14" />
-            </LinearGradient>
+      <FlatList
+        ref={listRef}
+        data={SLIDES}
+        keyExtractor={(s) => s.id}
+        renderItem={({ item }) => <SlideItem item={item} />}
+        horizontal
+        pagingEnabled
+        showsHorizontalScrollIndicator={false}
+        onViewableItemsChanged={onViewableItemsChanged}
+        viewabilityConfig={{ itemVisiblePercentThreshold: 50 }}
+      />
 
-            {/* Aurora Light Glow */}
-            <LinearGradient id="auroraGlow" x1="0%" y1="0%" x2="100%" y2="0%">
-              <Stop offset="0%" stopColor="#10B981" stopOpacity="0.0" />
-              <Stop offset="30%" stopColor="#06B6D4" stopOpacity="0.18" />
-              <Stop offset="70%" stopColor="#8B5CF6" stopOpacity="0.18" />
-              <Stop offset="100%" stopColor="#EC4899" stopOpacity="0.0" />
-            </LinearGradient>
+      {/* Bottom controls */}
+      <View style={introStyles.bottom}>
+        <Dots count={SLIDES.length} active={activeIndex} accent={activeSlide.accent} />
 
-            {/* Logo Ring Gradient */}
-            <LinearGradient id="logoGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-              <Stop offset="0%" stopColor="#8B5CF6" />
-              <Stop offset="50%" stopColor="#06B6D4" />
-              <Stop offset="100%" stopColor="#10B981" />
-            </LinearGradient>
-
-            {/* Button Gradient */}
-            <LinearGradient id="btnGrad" x1="0%" y1="0%" x2="100%" y2="0%">
-              <Stop offset="0%" stopColor="#6366F1" />
-              <Stop offset="100%" stopColor="#06B6D4" />
-            </LinearGradient>
-          </Defs>
-
-          {/* Sky background */}
-          <Rect width={SCREEN_WIDTH} height={SCREEN_HEIGHT} fill="url(#skyGrad)" />
-
-          {/* Aurora glow stripe */}
-          <Path
-            d={`M 0 ${SCREEN_HEIGHT * 0.45} Q ${SCREEN_WIDTH * 0.4} ${SCREEN_HEIGHT * 0.2} ${SCREEN_WIDTH} ${SCREEN_HEIGHT * 0.45} L ${SCREEN_WIDTH} ${SCREEN_HEIGHT} L 0 ${SCREEN_HEIGHT} Z`}
-            fill="url(#auroraGlow)"
-          />
-
-          {/* Mountain Silhouette at bottom */}
-          <Path
-            d={`M 0 ${SCREEN_HEIGHT * 0.85} L ${SCREEN_WIDTH * 0.25} ${SCREEN_HEIGHT * 0.72} L ${SCREEN_WIDTH * 0.55} ${SCREEN_HEIGHT * 0.8} L ${SCREEN_WIDTH * 0.8} ${SCREEN_HEIGHT * 0.68} L ${SCREEN_WIDTH} ${SCREEN_HEIGHT * 0.78} L ${SCREEN_WIDTH} ${SCREEN_HEIGHT} L 0 ${SCREEN_HEIGHT} Z`}
-            fill="#05080E"
-          />
-          <Path
-            d={`M 0 ${SCREEN_HEIGHT * 0.88} L ${SCREEN_WIDTH * 0.35} ${SCREEN_HEIGHT * 0.78} L ${SCREEN_WIDTH * 0.7} ${SCREEN_HEIGHT * 0.83} L ${SCREEN_WIDTH} ${SCREEN_HEIGHT * 0.75} L ${SCREEN_WIDTH} ${SCREEN_HEIGHT} L 0 ${SCREEN_HEIGHT} Z`}
-            fill="#020306"
-            opacity="0.9"
-          />
-        </Svg>
-      </View>
-
-      {/* Main Content Area */}
-      <View style={introStyles.content}>
-        {/* Glowing Logo Circle */}
-        <View style={introStyles.logoWrap}>
-          <Svg width={120} height={120} viewBox="0 0 120 120">
-            {/* Background ring */}
-            <Circle cx={60} cy={60} r={50} fill="none" stroke="#202633" strokeWidth={1} />
-            {/* Gradient glow ring */}
-            <Circle
-              cx={60}
-              cy={60}
-              r={46}
-              fill="none"
-              stroke="url(#logoGrad)"
-              strokeWidth={3}
-              strokeDasharray="290"
-              strokeDashoffset="60"
-              strokeLinecap="round"
-            />
-            {/* Inner dynamic content */}
-            <Circle cx={60} cy={60} r={32} fill="#090D14" />
-          </Svg>
-          <View style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]}>
-            <Text style={introStyles.logoCenterText}>4</Text>
-          </View>
-        </View>
-
-        {/* Branding Info */}
-        <View style={introStyles.branding}>
-          <Text style={introStyles.brandText}>A U R O R A</Text>
-          <Text style={introStyles.tagline}>Understand yourself{'\n'}better every day.</Text>
-        </View>
-      </View>
-
-      {/* Bottom Buttons */}
-      <View style={introStyles.bottomSection}>
-        {/* Gradient Button */}
         <TouchableOpacity
-          onPress={setSeenIntro}
-          style={introStyles.primaryBtn}
-          accessibilityLabel="Get Started"
+          onPress={goNext}
+          style={[introStyles.primaryBtn, { backgroundColor: activeSlide.accent }]}
+          accessibilityLabel={isLast ? 'Get Started' : 'Next'}
         >
-          <View style={StyleSheet.absoluteFill}>
-            <Svg width="100%" height="56">
-              <Rect width="100%" height="56" rx={28} fill="url(#btnGrad)" />
-            </Svg>
-          </View>
-          <Text style={introStyles.primaryBtnText}>Get Started</Text>
+          <Text style={introStyles.primaryBtnText}>
+            {isLast ? 'Get Started →' : 'Next →'}
+          </Text>
         </TouchableOpacity>
 
-        {/* Log In Link */}
-        <TouchableOpacity onPress={setSeenIntro} style={introStyles.loginBtn} accessibilityLabel="Log in">
-          <Text style={introStyles.loginBtnText}>Log In</Text>
-        </TouchableOpacity>
+        {!isLast && (
+          <TouchableOpacity onPress={skip} style={introStyles.skipBtn} accessibilityLabel="Skip">
+            <Text style={introStyles.skipText}>Skip</Text>
+          </TouchableOpacity>
+        )}
       </View>
     </SafeAreaView>
   );
@@ -129,70 +317,39 @@ export function IntroScreen() {
 const introStyles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: '#090D14',
+    backgroundColor: '#06080F',
   },
-  content: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: spacing.huge,
-    paddingTop: SCREEN_HEIGHT * 0.1,
-  },
-  logoWrap: {
-    width: 120,
-    height: 120,
-    alignItems: 'center',
-    justifyContent: 'center',
-    position: 'relative',
-  },
-  logoCenterText: {
-    color: '#8B5CF6',
-    fontSize: 16,
-    fontWeight: fontWeight.bold,
-  },
-  branding: {
-    alignItems: 'center',
-    gap: spacing.md,
-  },
-  brandText: {
-    color: colors.ink,
-    fontSize: type.title,
-    fontWeight: fontWeight.extrabold,
-    letterSpacing: 6,
-  },
-  tagline: {
-    color: colors.inkSoft,
-    fontSize: type.body + 2,
-    lineHeight: 28,
-    fontWeight: fontWeight.semibold,
-    textAlign: 'center',
-  },
-  bottomSection: {
+  bottom: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
     paddingHorizontal: spacing.xl,
-    paddingBottom: spacing.huge,
-    gap: spacing.md,
+    paddingBottom: spacing.xxxl,
+    paddingTop: spacing.xl,
+    alignItems: 'center',
+    gap: spacing.lg,
+    backgroundColor: 'transparent',
   },
   primaryBtn: {
+    width: '100%',
     height: 56,
     borderRadius: 28,
     alignItems: 'center',
     justifyContent: 'center',
-    position: 'relative',
-    overflow: 'hidden',
-    ...shadow,
   },
   primaryBtnText: {
-    color: colors.ink,
+    color: '#060810',
     fontSize: type.body,
     fontWeight: fontWeight.black,
+    letterSpacing: 0.3,
   },
-  loginBtn: {
-    alignItems: 'center',
-    justifyContent: 'center',
+  skipBtn: {
     paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.xl,
   },
-  loginBtnText: {
-    color: colors.muted,
+  skipText: {
+    color: '#475569',
     fontSize: type.small,
     fontWeight: fontWeight.bold,
   },

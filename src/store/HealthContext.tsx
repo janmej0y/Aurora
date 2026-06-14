@@ -533,7 +533,8 @@ export function HealthProvider({ children }: PropsWithChildren) {
   const signInWithGoogle = useCallback(async (): Promise<string | null> => {
     setAuthLoading(true);
     try {
-      const redirectTo = Linking.createURL('/');
+      // Use the deep-link scheme so Android redirects back to the app, not localhost
+      const redirectTo = 'aurora://auth/callback';
       const { data, error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: { redirectTo, skipBrowserRedirect: true },
@@ -545,7 +546,7 @@ export function HealthProvider({ children }: PropsWithChildren) {
         const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(result.url);
         if (exchangeError) return exchangeError.message;
       } else if (result.type === 'cancel') {
-        return null; // User dismissed — not an error
+        return null;
       }
       return null;
     } finally {

@@ -1,13 +1,9 @@
-import { useRef, useEffect, useState } from 'react';
-import { Animated, Platform, Pressable, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
-
-const useND = Platform.OS !== 'web';
+import { useRef, useEffect } from 'react';
+import { Animated, Pressable, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { BedDouble, Bell, Droplets, Flame, ListChecks, Plus, Salad, Sparkles, TrendingUp } from 'lucide-react-native';
-import { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import { useNavigation } from '@react-navigation/native';
 import Svg, { Circle, Defs, LinearGradient as SvgLinearGradient, RadialGradient, Stop, G, Path } from 'react-native-svg';
-import { AnimatedCircle } from '../components/AnimatedSvg';
 import { LinearGradient } from 'expo-linear-gradient';
 
 import { MiniBarChart } from '../components/visuals';
@@ -36,31 +32,32 @@ function AnimatedHealthRing({
   const fillOpacity = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
-    // 1. Heart fill fades in on mount
+    // All animations use useNativeDriver: false because we animate
+    // layout/SVG props (opacity on SVG, borderRadius scale, etc.)
+    // Mixing true/false in the same parallel crashes Android.
+
     Animated.timing(fillOpacity, {
-      toValue: 0.25, duration: 800, useNativeDriver: useND,
+      toValue: 0.25, duration: 800, useNativeDriver: false,
     }).start();
 
-    // 2. Heartbeat: quick scale up, quick down, pause, repeat
     const beat = Animated.loop(
       Animated.sequence([
-        Animated.timing(heartScale, { toValue: 1.22, duration: 140, useNativeDriver: useND }),
-        Animated.timing(heartScale, { toValue: 0.96, duration: 120, useNativeDriver: useND }),
-        Animated.timing(heartScale, { toValue: 1.14, duration: 100, useNativeDriver: useND }),
-        Animated.timing(heartScale, { toValue: 1.00, duration: 100, useNativeDriver: useND }),
-        Animated.delay(820), // ~1 beat per second
+        Animated.timing(heartScale, { toValue: 1.22, duration: 140, useNativeDriver: false }),
+        Animated.timing(heartScale, { toValue: 0.96, duration: 120, useNativeDriver: false }),
+        Animated.timing(heartScale, { toValue: 1.14, duration: 100, useNativeDriver: false }),
+        Animated.timing(heartScale, { toValue: 1.00, duration: 100, useNativeDriver: false }),
+        Animated.delay(820),
       ])
     );
 
-    // 3. Glow ring breathes outward in sync with beat
     const glow = Animated.loop(
       Animated.sequence([
         Animated.parallel([
-          Animated.timing(glowOpacity, { toValue: 0.55, duration: 360, useNativeDriver: useND }),
+          Animated.timing(glowOpacity, { toValue: 0.55, duration: 360, useNativeDriver: false }),
           Animated.timing(glowRadius,  { toValue: 24,   duration: 360, useNativeDriver: false }),
         ]),
         Animated.parallel([
-          Animated.timing(glowOpacity, { toValue: 0.08, duration: 700, useNativeDriver: useND }),
+          Animated.timing(glowOpacity, { toValue: 0.08, duration: 700, useNativeDriver: false }),
           Animated.timing(glowRadius,  { toValue: 18,   duration: 700, useNativeDriver: false }),
         ]),
         Animated.delay(220),
@@ -283,8 +280,8 @@ function AnimatedHabitRow({
 
   const handlePress = () => {
     Animated.sequence([
-      Animated.spring(scale, { toValue: 1.04, useNativeDriver: useND, tension: 300, friction: 6 }),
-      Animated.spring(scale, { toValue: 1, useNativeDriver: useND, tension: 300, friction: 6 }),
+      Animated.spring(scale, { toValue: 1.04, useNativeDriver: true, tension: 300, friction: 6 }),
+      Animated.spring(scale, { toValue: 1, useNativeDriver: true, tension: 300, friction: 6 }),
     ]).start(() => onComplete(habit.id));
   };
 
@@ -352,8 +349,8 @@ export function HomeScreen() {
     }
     const loop = Animated.loop(
       Animated.sequence([
-        Animated.timing(perfAnim, { toValue: 1, duration: 1600, useNativeDriver: useND }),
-        Animated.timing(perfAnim, { toValue: 0.25, duration: 1600, useNativeDriver: useND }),
+        Animated.timing(perfAnim, { toValue: 1, duration: 1600, useNativeDriver: false }),
+        Animated.timing(perfAnim, { toValue: 0.25, duration: 1600, useNativeDriver: false }),
       ])
     );
     loop.start();

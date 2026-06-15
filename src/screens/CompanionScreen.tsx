@@ -511,58 +511,63 @@ export function CompanionScreen() {
 
   // ── Core voice pipeline — called by both manual stop and auto-stop ──
   const runVoicePipeline = useCallback(async (uri: string | null) => {
-    if (!uri) {
-      setVoiceMode(false); setBusy(false); setUiStatus('idle');
-      return;
-    }
+    // Always close overlay and reset state at the end
+    const done = (opts?: { keepBusy?: boolean }) => {
+      setVoiceMode(false);
+      setUiStatus('idle');
+      if (!opts?.keepBusy) setBusy(false);
+    };
+
+    if (!uri) { done(); return; }
+
     try {
       const res = await sendAgentVoice(uri, state);
 
-      if (res.error === 'no_audio') {
-        // Audio never arrived — silent fail, don't show error message
-        setVoiceMode(false); setBusy(false); setUiStatus('idle');
+      // Server couldn't get audio or transcript — close overlay silently, user retries
+      if (res.error === 'no_audio' || res.error === 'no_transcript' || res.error === 'unclear' || res.error === 'low_confidence') {
+        done();
         return;
       }
-      if (res.error === 'no_transcript' || res.error === 'unclear' || res.error === 'no_audio') {
-        setVoiceMode(false); setBusy(false); setUiStatus('idle');
-        // Don't add a message — just close the overlay silently so user can try again
-        return;
-      }
-      if (!res.transcript && !res.reply) {
-        setVoiceMode(false); setBusy(false); setUiStatus('idle');
-        return;
-      }
-      if (res.error === 'low_confidence' || (res.needsConfirmation && res.transcript)) {
-        setPendingTranscript(res.transcript ?? '');
-        pendingResultRef.current = { reply: res.reply ?? '', actions: res.actions ?? [], intent: res.intent };
+
+      // Low confidence — show confirmation card (still inside overlay)
+      if (res.needsConfirmation && res.transcript) {
+        setPendingTranscript(res.transcript);
+        pendingResultRef.current = {
+          reply:   res.reply   ?? '',
+          actions: res.actions ?? [],
+          intent:  res.intent,
+        };
+        setVoiceMode(true); // keep overlay open
         setUiStatus('confirming');
         setBusy(false);
         return;
       }
 
-      // Auto-proceed (high confidence ≥ 0.7)
-      setVoiceMode(false);
+      // Success — close overlay FIRST then show messages
+      done({ keepBusy: true });
+
       if (res.transcript) {
         addChatMessage({ role: 'user', content: res.transcript });
         syncMessage('user', res.transcript);
       }
-      applyResult(res.reply, res.actions, res.intent);
+
+      if (res.reply) {
+        applyResult(res.reply, res.actions ?? [], res.intent);
+      } else {
+        setBusy(false);
+      }
+
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error('[Aurora] Voice pipeline error:', errMsg);
-      setVoiceMode(false);
-      setBusy(false);
-      setUiStatus('idle');
-      // Only show error message if it's a real network/server error
-      // (not a silent failure like empty audio)
-      const isNetworkError = errMsg.includes('fetch') || errMsg.includes('network') ||
-                             errMsg.includes('Network') || errMsg.includes('timeout') ||
-                             errMsg.includes('500') || errMsg.includes('ECONNREFUSED');
-      if (isNetworkError) {
-        const fallback = "Can't reach the Aurora server right now. Check your connection.";
-        addChatMessage({ role: 'assistant', content: fallback });
-        speak(fallback);
-      }
+      done();
+      const isTimeout = errMsg.includes('timed out') || errMsg.includes('waking up');
+      const fallback = isTimeout
+        ? 'The server is waking up. Wait a moment and try again.'
+        : "Couldn't reach the server. Check your connection.";
+      addChatMessage({ role: 'assistant', content: fallback });
+      speak(fallback);
+      setServerReady(false);
     }
   }, [state, addChatMessage, syncMessage, applyResult, speak]);
 

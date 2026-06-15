@@ -20,7 +20,7 @@ import { CheckCircle, ChevronLeft, Copy, Edit3, Keyboard, Mic, RefreshCw, Send, 
 import Svg, { Circle, Defs, RadialGradient, Stop, LinearGradient as SvgLinearGradient } from 'react-native-svg';
 
 import { useNavigation, useRoute } from '@react-navigation/native';
-import { sendAgentText, sendAgentVoice } from '../services/agentApi';
+import { pingServer, sendAgentText, sendAgentVoice } from '../services/agentApi';
 import { supabase } from '../lib/supabase';
 import { useHealth } from '../store/HealthContext';
 import { AgentAction } from '../types/health';
@@ -292,7 +292,7 @@ function VoiceOverlay({
             : 'Starting...'}
           </Text>
           <Text style={cs.voiceSubtext}>
-            {isListening  ? 'Auto-sends after 3s of silence'
+            {isListening  ? 'Tap ■ when done, or wait 8s'
             : isProcessing ? 'Just a moment...'
             : 'Opening microphone...'}
           </Text>
@@ -331,7 +331,7 @@ function VoiceOverlay({
 
         {/* Tap hint */}
         {isListening && (
-          <Text style={cs.voiceTapHint}>Tap the orb or ■ to send</Text>
+          <Text style={cs.voiceTapHint}>Speak now • Tap ■ to send early</Text>
         )}
       </SafeAreaView>
     </View>
@@ -384,6 +384,7 @@ export function CompanionScreen() {
   const [pendingTranscript,  setPendingTranscript]  = useState('');
   const [lastIntent,         setLastIntent]         = useState<string | null>(null);
   const [showBanner,         setShowBanner]         = useState(false);
+  const [serverReady,        setServerReady]        = useState<boolean | null>(null);
 
   const scrollRef        = useRef<ScrollView>(null);
   const handledLaunchRef = useRef<string | undefined>(undefined);
@@ -402,9 +403,11 @@ export function CompanionScreen() {
 
   const { isRecording, requestPermission, startRecording: recorderStart, stopRecording: recorderStop } = useVoiceRecorder(onAutoStop);
 
-  // Request mic permission on mount
+  // Request mic permission + ping server on mount
   useEffect(() => {
     requestPermission().then(ok => setPermissionGranted(ok)).catch(() => setPermissionGranted(false));
+    // Wake up Render server in background — free tier sleeps after 15min
+    pingServer().then(ok => setServerReady(ok)).catch(() => setServerReady(false));
   }, []);
 
   useEffect(() => {
@@ -447,6 +450,7 @@ export function CompanionScreen() {
     addChatMessage({ role: 'assistant', content: reply });
     syncMessage('assistant', reply);
     if (intent) { setLastIntent(intent); setShowBanner(true); }
+    setServerReady(true); // server responded successfully
     setBusy(false);
     speak(reply);
   }, [applyAgentActions, addChatMessage, syncMessage, speak]);
@@ -463,12 +467,17 @@ export function CompanionScreen() {
     try {
       const res = await sendAgentText(msg, state);
       applyResult(res.reply, res.actions, res.intent);
-    } catch {
-      const fallback = "I couldn't reach the Aurora server. Make sure it's running with `npm run api` and try again.";
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : '';
+      const isTimeout = errMsg.includes('timed out') || errMsg.includes('waking up');
+      const fallback = isTimeout
+        ? "The server is waking up from sleep. Wait 30 seconds and try again."
+        : "Couldn't reach the Aurora server. Check your connection and try again.";
       addChatMessage({ role: 'assistant', content: fallback });
       speak(fallback);
       setBusy(false);
       setUiStatus('idle');
+      setServerReady(false);
     }
   }, [input, busy, state, addChatMessage, syncMessage, applyResult, speak]);
 
@@ -514,12 +523,9 @@ export function CompanionScreen() {
         setVoiceMode(false); setBusy(false); setUiStatus('idle');
         return;
       }
-      if (res.error === 'no_transcript' || res.error === 'unclear') {
-        // Mic picked up nothing useful — prompt user to try again
+      if (res.error === 'no_transcript' || res.error === 'unclear' || res.error === 'no_audio') {
         setVoiceMode(false); setBusy(false); setUiStatus('idle');
-        const msg = "I didn't catch that. Try speaking a bit louder or tap the mic again.";
-        addChatMessage({ role: 'assistant', content: msg });
-        speak(msg);
+        // Don't add a message — just close the overlay silently so user can try again
         return;
       }
       if (!res.transcript && !res.reply) {
@@ -541,13 +547,22 @@ export function CompanionScreen() {
         syncMessage('user', res.transcript);
       }
       applyResult(res.reply, res.actions, res.intent);
-    } catch {
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error('[Aurora] Voice pipeline error:', errMsg);
       setVoiceMode(false);
-      const fallback = "I heard you but couldn't process that. Try typing it instead.";
-      addChatMessage({ role: 'assistant', content: fallback });
-      speak(fallback);
       setBusy(false);
       setUiStatus('idle');
+      // Only show error message if it's a real network/server error
+      // (not a silent failure like empty audio)
+      const isNetworkError = errMsg.includes('fetch') || errMsg.includes('network') ||
+                             errMsg.includes('Network') || errMsg.includes('timeout') ||
+                             errMsg.includes('500') || errMsg.includes('ECONNREFUSED');
+      if (isNetworkError) {
+        const fallback = "Can't reach the Aurora server right now. Check your connection.";
+        addChatMessage({ role: 'assistant', content: fallback });
+        speak(fallback);
+      }
     }
   }, [state, addChatMessage, syncMessage, applyResult, speak]);
 
@@ -556,14 +571,19 @@ export function CompanionScreen() {
 
   // ── Manual stop (user taps button/orb) ────────────────────────────
   const stopRecording = useCallback(async () => {
+    if (!isRecording) return; // already stopped by auto-stop
     setUiStatus('processing');
     setBusy(true);
     const uri = await recorderStop();
-    // If auto-stop already fired and ran the pipeline, recorderStop returns null — ignore
-    if (uri !== null) {
+    if (uri) {
       await runVoicePipeline(uri);
+    } else {
+      // Auto-stop already handled it, or no audio was captured
+      setVoiceMode(false);
+      setBusy(false);
+      setUiStatus('idle');
     }
-  }, [recorderStop, runVoicePipeline]);
+  }, [isRecording, recorderStop, runVoicePipeline]);
 
   // ── Confirm pending transcript ────────────────────────────────────
   const confirmTranscript = useCallback(() => {
@@ -621,6 +641,13 @@ export function CompanionScreen() {
 
   return (
     <SafeAreaView style={cs.screen}>
+
+      {/* ── Server offline banner ── */}
+      {serverReady === false && (
+        <View style={cs.offlineBanner}>
+          <Text style={cs.offlineBannerText}>⚠ Server is waking up — first message may take 30s</Text>
+        </View>
+      )}
 
       {/* ── Action confirmation banner ── */}
       {showBanner && lastIntent && (
@@ -814,6 +841,13 @@ export function CompanionScreen() {
 // ─── Styles ───────────────────────────────────────────────────────
 const cs = StyleSheet.create({
   screen: { flex: 1, backgroundColor: '#0D1117' },
+
+  // Server offline banner
+  offlineBanner: {
+    backgroundColor: '#7C2D12', paddingHorizontal: spacing.lg, paddingVertical: 8,
+    flexDirection: 'row', alignItems: 'center',
+  },
+  offlineBannerText: { color: '#FED7AA', fontSize: 12, fontWeight: fontWeight.bold, flex: 1, textAlign: 'center' },
 
   // Action banner
   actionBanner: {

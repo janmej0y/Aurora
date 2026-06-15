@@ -1,14 +1,15 @@
 /**
  * Platform-aware voice recorder.
  *
- * Web:    MediaRecorder + AnalyserNode for real RMS silence detection
- * Native: expo-audio AudioRecorder with fixed auto-stop timer
+ * Web:    MediaRecorder + AnalyserNode silence detection
+ * Native: expo-audio with manual stop + fallback timer
  *
- * onAutoStop is called with the file URI when recording ends (auto or manual).
+ * onAutoStop(uri) is called when the timer fires.
+ * stopRecording() returns a Promise<uri> for manual stop.
  */
 
 import { Platform } from 'react-native';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import {
   RecordingPresets,
   requestRecordingPermissionsAsync,
@@ -16,25 +17,24 @@ import {
   useAudioRecorder,
 } from 'expo-audio';
 
-const SILENCE_TIMEOUT_MS = 4000;  // 4 s → auto-stop
-const MAX_DURATION_MS    = 60_000;
-const SPEECH_THRESHOLD   = 0.015;
-const POLL_INTERVAL_MS   = 120;
+// Give users 8 seconds before auto-stopping — enough time to speak a full sentence
+const AUTO_STOP_MS   = 8000;
+const MAX_DURATION_MS = 60_000;
 
 // ─── Web ─────────────────────────────────────────────────────────
 
 function useWebVoiceRecorder(onAutoStop: (uri: string | null) => void) {
   const [isRecording, setIsRecording] = useState(false);
 
-  const mediaRecorderRef   = useRef<MediaRecorder | null>(null);
-  const chunksRef          = useRef<Blob[]>([]);
-  const audioCtxRef        = useRef<AudioContext | null>(null);
-  const analyserRef        = useRef<AnalyserNode | null>(null);
-  const pollTimerRef       = useRef<ReturnType<typeof setInterval> | null>(null);
-  const silenceTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const maxTimerRef        = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const autoStopCalledRef  = useRef(false);
-  const stopResolveRef     = useRef<((url: string | null) => void) | null>(null);
+  const mediaRecorderRef  = useRef<MediaRecorder | null>(null);
+  const chunksRef         = useRef<Blob[]>([]);
+  const audioCtxRef       = useRef<AudioContext | null>(null);
+  const analyserRef       = useRef<AnalyserNode | null>(null);
+  const pollTimerRef      = useRef<ReturnType<typeof setInterval> | null>(null);
+  const silenceTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const maxTimerRef       = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoStopCalledRef = useRef(false);
+  const stopResolveRef    = useRef<((url: string | null) => void) | null>(null);
 
   const clearTimers = useCallback(() => {
     if (pollTimerRef.current)    { clearInterval(pollTimerRef.current);   pollTimerRef.current  = null; }
@@ -91,6 +91,7 @@ function useWebVoiceRecorder(onAutoStop: (uri: string | null) => void) {
       mediaRecorderRef.current = mr;
       mr.start(100);
 
+      // Silence detection via AnalyserNode
       const audioCtx = new AudioContext();
       const source   = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
@@ -101,7 +102,8 @@ function useWebVoiceRecorder(onAutoStop: (uri: string | null) => void) {
       analyserRef.current = analyser;
 
       const buf = new Float32Array(analyser.fftSize);
-      silenceTimerRef.current = setTimeout(triggerAutoStop, SILENCE_TIMEOUT_MS);
+      let hasSpeech = false;
+      silenceTimerRef.current = setTimeout(triggerAutoStop, AUTO_STOP_MS);
 
       pollTimerRef.current = setInterval(() => {
         if (!analyserRef.current) return;
@@ -109,13 +111,13 @@ function useWebVoiceRecorder(onAutoStop: (uri: string | null) => void) {
         let sumSq = 0;
         for (let i = 0; i < buf.length; i++) sumSq += buf[i] * buf[i];
         const rms = Math.sqrt(sumSq / buf.length);
-        if (rms > SPEECH_THRESHOLD) {
-          if (silenceTimerRef.current) {
-            clearTimeout(silenceTimerRef.current);
-            silenceTimerRef.current = setTimeout(triggerAutoStop, SILENCE_TIMEOUT_MS);
-          }
+        if (rms > 0.015) {
+          hasSpeech = true;
+          // Reset silence timer on speech — only auto-stop after 3s of silence AFTER speech
+          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = setTimeout(triggerAutoStop, hasSpeech ? 3000 : AUTO_STOP_MS);
         }
-      }, POLL_INTERVAL_MS);
+      }, 120);
 
       maxTimerRef.current = setTimeout(triggerAutoStop, MAX_DURATION_MS);
       setIsRecording(true);
@@ -151,55 +153,43 @@ function useWebVoiceRecorder(onAutoStop: (uri: string | null) => void) {
 
 // ─── Native ───────────────────────────────────────────────────────
 
-function useNativeVoiceRecorder(onAutoStop: (uri: string | null) => void) {
+function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
   const [isRecording,       setIsRecording]       = useState(false);
   const [permissionGranted, setPermissionGranted] = useState<boolean | null>(null);
 
-  const recorder        = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+
+  // Store callbacks in refs so timer callbacks always see the latest version
+  const onAutoStopRef   = useRef(onAutoStopProp);
+  onAutoStopRef.current = onAutoStopProp;
+
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const maxTimerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoStoppedRef  = useRef(false);
-  const stopResolveRef  = useRef<((uri: string | null) => void) | null>(null);
+  const isRecordingRef  = useRef(false); // mirror of state, readable inside async callbacks
 
   const clearTimers = useCallback(() => {
     if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null; }
     if (maxTimerRef.current)     { clearTimeout(maxTimerRef.current);     maxTimerRef.current     = null; }
   }, []);
 
-  // recordingStatusUpdate is the reliable way to get the URI after stop()
-  useEffect(() => {
-    const sub = recorder.addListener('recordingStatusUpdate', (status) => {
-      if (status.isFinished) {
-        const uri = status.url ?? recorder.uri ?? null;
-        setIsRecording(false);
-        clearTimers();
-        if (stopResolveRef.current) {
-          stopResolveRef.current(uri);
-          stopResolveRef.current = null;
-        } else if (autoStoppedRef.current) {
-          onAutoStop(uri);
-        }
-      }
-    });
-    return () => sub.remove();
-  }, [recorder, clearTimers, onAutoStop]);
-
   const requestPermission = useCallback(async (): Promise<boolean> => {
     try {
-      const result  = await requestRecordingPermissionsAsync();
-      const granted = result.granted;
+      const { granted } = await requestRecordingPermissionsAsync();
       setPermissionGranted(granted);
       if (granted) {
         await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
       }
       return granted;
-    } catch {
+    } catch (err) {
+      console.warn('[VoiceRecorder] Permission error:', err);
       return false;
     }
   }, []);
 
   const startRecording = useCallback(async (): Promise<boolean> => {
     try {
+      // Always check permission freshly
       if (!permissionGranted) {
         const ok = await requestPermission();
         if (!ok) return false;
@@ -207,60 +197,70 @@ function useNativeVoiceRecorder(onAutoStop: (uri: string | null) => void) {
 
       clearTimers();
       autoStoppedRef.current = false;
-      stopResolveRef.current = null;
 
       // prepareToRecordAsync MUST be called before every record()
       await recorder.prepareToRecordAsync();
       recorder.record();
       setIsRecording(true);
+      isRecordingRef.current = true;
 
+      // Auto-stop: give user 8s to speak before we stop automatically
       const doAutoStop = async () => {
         if (autoStoppedRef.current) return;
+        if (!isRecordingRef.current) return;
         autoStoppedRef.current = true;
         clearTimers();
+
         try {
           await recorder.stop();
-          // URI delivered via recordingStatusUpdate listener
-        } catch (err) {
-          console.warn('[VoiceRecorder] Auto-stop error:', err);
+          isRecordingRef.current = false;
           setIsRecording(false);
-          onAutoStop(null);
+          // Wait a tick for the recorder to write the file
+          await new Promise(r => setTimeout(r, 150));
+          const uri = recorder.uri ?? null;
+          onAutoStopRef.current(uri);
+        } catch (err) {
+          console.warn('[VoiceRecorder] Auto-stop failed:', err);
+          isRecordingRef.current = false;
+          setIsRecording(false);
+          onAutoStopRef.current(null);
         }
       };
 
-      silenceTimerRef.current = setTimeout(doAutoStop, SILENCE_TIMEOUT_MS);
+      silenceTimerRef.current = setTimeout(doAutoStop, AUTO_STOP_MS);
       maxTimerRef.current     = setTimeout(doAutoStop, MAX_DURATION_MS);
 
       return true;
     } catch (err) {
       console.warn('[VoiceRecorder] Native start failed:', err);
       setIsRecording(false);
+      isRecordingRef.current = false;
       return false;
     }
-  }, [recorder, permissionGranted, requestPermission, clearTimers, onAutoStop]);
+  }, [recorder, permissionGranted, requestPermission, clearTimers]);
 
-  const stopRecording = useCallback((): Promise<string | null> => {
-    return new Promise(async (resolve) => {
-      clearTimers();
-      autoStoppedRef.current = true;
+  const stopRecording = useCallback(async (): Promise<string | null> => {
+    clearTimers();
+    autoStoppedRef.current = true;
 
-      if (!recorder.isRecording) {
-        // Auto-stop already fired and stopped it — resolve with current URI
-        resolve(recorder.uri ?? null);
-        return;
-      }
+    if (!isRecordingRef.current) {
+      // Already stopped by auto-stop
+      return recorder.uri ?? null;
+    }
 
-      stopResolveRef.current = resolve;
-      try {
-        await recorder.stop();
-        // URI delivered via recordingStatusUpdate → stopResolveRef
-      } catch (err) {
-        console.warn('[VoiceRecorder] Manual stop error:', err);
-        stopResolveRef.current = null;
-        setIsRecording(false);
-        resolve(null);
-      }
-    });
+    try {
+      await recorder.stop();
+      isRecordingRef.current = false;
+      setIsRecording(false);
+      // Small delay to let the native layer flush the file
+      await new Promise(r => setTimeout(r, 150));
+      return recorder.uri ?? null;
+    } catch (err) {
+      console.warn('[VoiceRecorder] Manual stop failed:', err);
+      isRecordingRef.current = false;
+      setIsRecording(false);
+      return null;
+    }
   }, [recorder, clearTimers]);
 
   return { isRecording, requestPermission, startRecording, stopRecording };

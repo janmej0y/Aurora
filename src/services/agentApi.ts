@@ -60,7 +60,37 @@ async function parseResult(response: Response): Promise<AgentResult> {
     const text = await response.text().catch(() => '');
     throw new Error(`Aurora API ${response.status}: ${text.slice(0, 120)}`);
   }
-  return (await response.json()) as AgentResult;
+  const json = await response.json() as AgentResult;
+  // Server always returns a reply — if missing, generate a fallback so we never throw
+  if (!json.reply) {
+    json.reply = "Got it! I've logged that for you.";
+  }
+  return json;
+}
+
+// ─── Fetch with timeout ────────────────────────────────────────────
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 25000): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(id);
+    return response;
+  } catch (err: unknown) {
+    clearTimeout(id);
+    const isAbort = err instanceof Error && err.name === 'AbortError';
+    throw new Error(isAbort ? 'Request timed out — the server may be waking up, try again.' : (err instanceof Error ? err.message : 'Network error'));
+  }
+}
+
+// ─── Server keepalive — call on app start to wake Render from sleep ─
+export async function pingServer(): Promise<boolean> {
+  try {
+    const res = await fetchWithTimeout(`${API_BASE_URL}/api/health`, {}, 20000);
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 // ─── Text chat ───────────────────────────────────────────────────
@@ -70,7 +100,7 @@ export async function sendAgentText(
 ): Promise<AgentResult> {
   const [userId] = await Promise.all([getCurrentUserId()]);
 
-  const response = await fetch(`${API_BASE_URL}/api/agent/chat`, {
+  const response = await fetchWithTimeout(`${API_BASE_URL}/api/agent/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -113,10 +143,10 @@ export async function sendAgentVoice(
   form.append('context',     JSON.stringify(buildMinimalContext(state)));
   form.append('chatHistory', JSON.stringify(buildChatHistory(state.chatMessages)));
 
-  const response = await fetch(`${API_BASE_URL}/api/agent/voice`, {
+  const response = await fetchWithTimeout(`${API_BASE_URL}/api/agent/voice`, {
     method: 'POST',
     body:   form,
-  });
+  }, 30000); // voice needs a bit longer — transcription takes time
 
   return parseResult(response);
 }

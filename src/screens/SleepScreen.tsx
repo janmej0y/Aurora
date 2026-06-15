@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { KeyboardAvoidingView, Modal, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import { BedDouble, ChevronLeft, Info, Moon, Plus, X } from 'lucide-react-native';
@@ -193,6 +193,7 @@ export function SleepScreen() {
 
       {/* Log Modal */}
       <Modal visible={showLogModal} animationType="slide" transparent onRequestClose={() => setShowLogModal(false)}>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <View style={sleepStyles.modalOverlay}>
           <TouchableOpacity style={sleepStyles.modalBackdrop} onPress={() => setShowLogModal(false)} activeOpacity={1} />
           <View style={[sleepStyles.modalSheet, { backgroundColor: tc.surface, borderColor: tc.border }]}>
@@ -247,6 +248,7 @@ export function SleepScreen() {
             </TouchableOpacity>
           </View>
         </View>
+        </KeyboardAvoidingView>
       </Modal>
     </SafeAreaView>
   );

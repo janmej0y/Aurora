@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ScrollView, StyleSheet, Text, TouchableOpacity, View, Modal, TextInput, Alert } from 'react-native';
+import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View, Modal, TextInput, Alert } from 'react-native';
 import * as Notifications from 'expo-notifications';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
@@ -352,6 +352,7 @@ export function ProfileScreen() {
 
       {/* Personal Info Modal */}
       <Modal visible={activeModal === 'personal'} animationType="slide" transparent>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <View style={modalStyles.overlay}>
           <TouchableOpacity style={modalStyles.backdrop} onPress={() => setActiveModal(null)} activeOpacity={1} />
           <View style={modalStyles.sheet}>
@@ -393,6 +394,7 @@ export function ProfileScreen() {
             </ScrollView>
           </View>
         </View>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* Goals Selection Modal */}

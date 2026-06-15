@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { KeyboardAvoidingView, Modal, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import { ChevronLeft, Info, Plus, Trash2, Utensils, X } from 'lucide-react-native';
@@ -201,6 +201,7 @@ export function NutritionScreen() {
 
       {/* Add Meal Modal */}
       <Modal visible={showAddModal} animationType="slide" transparent onRequestClose={() => setShowAddModal(false)}>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <View style={nutStyles.modalOverlay}>
           <TouchableOpacity style={nutStyles.modalBackdrop} onPress={() => setShowAddModal(false)} activeOpacity={1} />
           <ScrollView style={nutStyles.modalSheetScroll} contentContainerStyle={nutStyles.modalSheet} keyboardShouldPersistTaps="handled">
@@ -264,6 +265,7 @@ export function NutritionScreen() {
             </TouchableOpacity>
           </ScrollView>
         </View>
+        </KeyboardAvoidingView>
       </Modal>
     </SafeAreaView>
   );

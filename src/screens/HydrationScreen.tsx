@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Alert, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Alert, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import { ChevronLeft, Droplets, Info, Plus, Settings, X } from 'lucide-react-native';
@@ -218,6 +218,7 @@ export function HydrationScreen() {
 
       {/* Custom Amount Modal */}
       <Modal visible={showCustomModal} animationType="slide" transparent onRequestClose={() => setShowCustomModal(false)}>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <View style={hydStyles.modalOverlay}>
           <TouchableOpacity style={hydStyles.modalBackdrop} onPress={() => setShowCustomModal(false)} activeOpacity={1} />
           <View style={[hydStyles.modalSheet, { backgroundColor: tc.surface, borderColor: tc.border }]}>
@@ -247,10 +248,12 @@ export function HydrationScreen() {
             </TouchableOpacity>
           </View>
         </View>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* Goal Modal */}
       <Modal visible={showGoalModal} animationType="slide" transparent onRequestClose={() => setShowGoalModal(false)}>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <View style={hydStyles.modalOverlay}>
           <TouchableOpacity style={hydStyles.modalBackdrop} onPress={() => setShowGoalModal(false)} activeOpacity={1} />
           <View style={[hydStyles.modalSheet, { backgroundColor: tc.surface, borderColor: tc.border }]}>
@@ -274,6 +277,7 @@ export function HydrationScreen() {
             </TouchableOpacity>
           </View>
         </View>
+        </KeyboardAvoidingView>
       </Modal>
     </SafeAreaView>
   );

@@ -3,6 +3,7 @@ import {
   Alert,
   Animated,
   Easing,
+  KeyboardAvoidingView,
   Modal,
   Platform,
   ScrollView,
@@ -656,6 +657,12 @@ export function CompanionScreen() {
         </TouchableOpacity>
       </View>
 
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={0}
+      >
+
       {/* ── Messages ── */}
       <ScrollView
         ref={scrollRef}
@@ -785,6 +792,8 @@ export function CompanionScreen() {
           </TouchableOpacity>
         </View>
       </View>
+
+      </KeyboardAvoidingView>
 
       {/* ── Full-screen voice overlay ── */}
       <Modal visible={voiceMode} transparent={false} animationType="fade" statusBarTranslucent onRequestClose={cancelVoice}>

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Alert, Modal, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Alert, KeyboardAvoidingView, Modal, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import {
@@ -613,6 +613,7 @@ export function HabitsScreen() {
         animationType="slide"
         onRequestClose={() => setEditHabit(null)}
       >
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         {editHabit && (
           <HabitForm
             title="Save Changes"
@@ -621,6 +622,7 @@ export function HabitsScreen() {
             onClose={() => setEditHabit(null)}
           />
         )}
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* ── Create Modal ── */}
@@ -630,11 +632,13 @@ export function HabitsScreen() {
         animationType="slide"
         onRequestClose={() => setShowCreate(false)}
       >
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <HabitForm
           title="Create Habit"
           onSubmit={handleCreate}
           onClose={() => setShowCreate(false)}
         />
+        </KeyboardAvoidingView>
       </Modal>
     </SafeAreaView>
   );

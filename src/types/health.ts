@@ -146,3 +146,24 @@ export type AgentResponse = {
   actions: AgentAction[];
   error?: string;
 };
+
+// ─── Rich card payload — attached to assistant ChatMessages ──────────────────
+// Stored as JSON string in ChatMessage.content when role === 'assistant'
+// and the message carries a card. The CompanionScreen checks for this
+// by looking for a leading JSON block marker in the content string.
+
+export type RichCardType =
+  | 'health_summary'
+  | 'hydration_update'
+  | 'sleep_update'
+  | 'habit_progress'
+  | 'nutrition_log'
+  | 'weekly_report'
+  | 'insight';
+
+export type RichMessagePayload = {
+  cardType: RichCardType;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  cardData: Record<string, any>;
+  text: string; // natural language reply below the card
+};

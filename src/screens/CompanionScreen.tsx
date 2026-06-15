@@ -1,3 +1,15 @@
+/**
+ * Aurora — AI Companion Screen (redesigned)
+ *
+ * Architecture:
+ *  • state.chatMessages stores every message. Index 0 = system seed (never shown).
+ *  • Assistant messages that carry a rich card encode a JSON block as the first
+ *    line of content: <<CARD:{...}>>  followed by a newline and the text reply.
+ *    CompanionScreen parses this at render time; nothing extra is persisted.
+ *  • applyAgentActions updates LOCAL state only (server already wrote to Supabase).
+ *  • buildRichPayload() decides which card type to attach based on intent + actions.
+ */
+
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert,
@@ -16,75 +28,242 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Speech from 'expo-speech';
 import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
-import { CheckCircle, ChevronLeft, Copy, Edit3, Keyboard, Mic, RefreshCw, Send, Sparkles, Square, Volume2, X } from 'lucide-react-native';
-import Svg, { Circle, Defs, RadialGradient, Stop, LinearGradient as SvgLinearGradient } from 'react-native-svg';
+import {
+  Brain, CheckCircle, ChevronLeft, Copy, Keyboard,
+  Mic, RefreshCw, Send, Sparkles, Square, TrendingUp,
+  Volume2, X, Droplets, Moon, Target, Apple,
+} from 'lucide-react-native';
+import Svg, {
+  Circle, Defs, RadialGradient, Stop,
+  LinearGradient as SvgLinearGradient,
+} from 'react-native-svg';
 
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { pingServer, sendAgentText, sendAgentVoice } from '../services/agentApi';
 import { supabase } from '../lib/supabase';
 import { useHealth } from '../store/HealthContext';
-import { AgentAction } from '../types/health';
+import { AgentAction, RichCardType, RichMessagePayload } from '../types/health';
 import { AuroraLaunchParams } from '../types/navigation';
-import { colors, fontWeight, radius, shadow, shadowLg, spacing, type } from '../theme/tokens';
+import { colors, fontWeight, radius, shadow, spacing, type } from '../theme/tokens';
+import {
+  HealthSummaryCard, HydrationCard, SleepCard,
+  HabitProgressCard, NutritionCard, InsightCard, WeeklyReportCard,
+} from '../components/HealthCards';
 
 const useND = Platform.OS !== 'web';
 
-// ─── UI states ───────────────────────────────────────────────────
-// idle → listening → processing → confirming (if low confidence) → speaking
+// ─── UI states ────────────────────────────────────────────────────
 type UIStatus = 'idle' | 'listening' | 'processing' | 'confirming' | 'speaking';
 
-// ─── Chips ───────────────────────────────────────────────────────
-const ALL_CHIPS = [
-  { id: 'week',    emoji: '📊', label: 'How am I doing?',  text: 'How am I doing this week?' },
-  { id: 'water',   emoji: '💧', label: 'Log water',        text: 'I drank 500ml of water' },
-  { id: 'sleep',   emoji: '🌙', label: 'Log sleep',        text: 'I slept 7 hours last night' },
-  { id: 'habits',  emoji: '✅', label: 'My habits',         text: 'What habits should I focus on today?' },
-  { id: 'meal',    emoji: '🍽', label: 'Log meal',          text: 'I had lunch' },
-  { id: 'energy',  emoji: '⚡', label: 'Energy tips',       text: 'How can I improve my energy levels?' },
-  { id: 'insight', emoji: '🔍', label: 'Health patterns',   text: 'What pattern do you notice in my health?' },
-];
+// ─── Card marker helpers ──────────────────────────────────────────
+const CARD_PREFIX = '<<CARD:';
+const CARD_SUFFIX = '>>';
+
+function encodeCard(payload: RichMessagePayload): string {
+  return `${CARD_PREFIX}${JSON.stringify(payload)}${CARD_SUFFIX}\n${payload.text}`;
+}
+
+function decodeCard(content: string): { payload: RichMessagePayload; text: string } | null {
+  if (!content.startsWith(CARD_PREFIX)) return null;
+  try {
+    const end = content.indexOf(CARD_SUFFIX);
+    if (end === -1) return null;
+    const json    = content.slice(CARD_PREFIX.length, end);
+    const payload = JSON.parse(json) as RichMessagePayload;
+    const text    = content.slice(end + CARD_SUFFIX.length + 1); // skip \n
+    return { payload, text };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Build rich payload from agent result ────────────────────────
+function buildRichPayload(
+  intent: string | undefined,
+  actions: AgentAction[],
+  reply: string,
+  state: ReturnType<typeof useHealth>['state'],
+): RichMessagePayload | null {
+  // Always use REAL data from state — never hardcode health values
+
+  if (intent === 'log_water' || actions.some(a => a.type === 'ADD_WATER')) {
+    const waterAction = actions.find((a): a is Extract<AgentAction, { type: 'ADD_WATER' }> => a.type === 'ADD_WATER');
+    return {
+      cardType: 'hydration_update',
+      cardData: {
+        currentMl:   state.hydration.currentMl,
+        goalMl:      state.hydration.goalMl,
+        addedMl:     waterAction?.amountMl,
+      },
+      text: reply,
+    };
+  }
+
+  if (intent === 'log_sleep' || actions.some(a => a.type === 'LOG_SLEEP')) {
+    const sleepAction = actions.find((a): a is Extract<AgentAction, { type: 'LOG_SLEEP' }> => a.type === 'LOG_SLEEP');
+    const lastLog = state.sleep.logs[0];
+    return {
+      cardType: 'sleep_update',
+      cardData: {
+        hours:       sleepAction?.hours ?? state.sleep.lastHours,
+        bedtime:     sleepAction?.bedtime ?? lastLog?.bedtime,
+        wakeTime:    sleepAction?.wakeTime ?? lastLog?.wakeTime,
+        quality:     lastLog?.quality,
+        weeklyAvg:   state.sleep.weeklyAverage,
+      },
+      text: reply,
+    };
+  }
+
+  if (intent === 'create_habit' || actions.some(a => a.type === 'CREATE_HABIT')) {
+    const habitAction = actions.find((a): a is Extract<AgentAction, { type: 'CREATE_HABIT' }> => a.type === 'CREATE_HABIT');
+    return {
+      cardType: 'habit_progress',
+      cardData: {
+        habits:     state.habits.filter(h => !h.paused),
+        newHabit:   habitAction?.title,
+      },
+      text: reply,
+    };
+  }
+
+  if (intent === 'complete_habit' || actions.some(a => a.type === 'COMPLETE_HABIT')) {
+    return {
+      cardType: 'habit_progress',
+      cardData: {
+        habits: state.habits.filter(h => !h.paused),
+      },
+      text: reply,
+    };
+  }
+
+  if (intent === 'log_meal' || actions.some(a => a.type === 'ADD_MEAL')) {
+    const mealAction = actions.find((a): a is Extract<AgentAction, { type: 'ADD_MEAL' }> => a.type === 'ADD_MEAL');
+    const today = new Date().toISOString().slice(0, 10);
+    const todayMeals = state.meals.filter(m => m.date === today);
+    const totalCals = todayMeals.reduce((s, m) => s + m.calories, 0);
+    const totalProt = todayMeals.reduce((s, m) => s + m.protein, 0);
+    const totalCarb = todayMeals.reduce((s, m) => s + m.carbs, 0);
+    const totalFat  = todayMeals.reduce((s, m) => s + m.fat, 0);
+    return {
+      cardType: 'nutrition_log',
+      cardData: {
+        calories:  totalCals,
+        protein:   totalProt,
+        carbs:     totalCarb,
+        fat:       totalFat,
+        mealName:  mealAction?.name,
+        mealType:  mealAction?.mealType,
+      },
+      text: reply,
+    };
+  }
+
+  if (intent === 'get_health_summary' || intent === 'get_hydration_status' ||
+      intent === 'get_sleep_status'   || intent === 'get_habit_status'     ||
+      intent === 'get_nutrition_status') {
+    const today      = new Date().toISOString().slice(0, 10);
+    const active     = state.habits.filter(h => !h.paused);
+    const done       = active.filter(h => h.completedToday).length;
+    const hydrPct    = state.hydration.goalMl > 0
+      ? Math.round((state.hydration.currentMl / state.hydration.goalMl) * 100)
+      : 0;
+    const todayMeals = state.meals.filter(m => m.date === today);
+    const cals       = todayMeals.reduce((s, m) => s + m.calories, 0);
+    const topStreak  = Math.max(0, ...state.habits.map(h => h.streak));
+    const consistPct = state.sleep.consistency;
+
+    // Pick focused area dynamically from real data
+    const focusArea = hydrPct < 60 ? 'Hydration'
+                    : state.sleep.lastHours < 6.5 ? 'Sleep'
+                    : done < active.length * 0.6   ? 'Habits'
+                    : cals < 1200                   ? 'Nutrition'
+                    : undefined;
+
+    return {
+      cardType: 'health_summary',
+      cardData: {
+        hydrationPct:    hydrPct,
+        hydrationMl:     state.hydration.currentMl,
+        hydrationGoalMl: state.hydration.goalMl,
+        sleepHours:      state.sleep.lastHours,
+        sleepGoalHours:  8,
+        habitsCompleted: done,
+        habitsTotal:     active.length,
+        consistencyPct:  consistPct,
+        streaks:         topStreak,
+        focusArea,
+      },
+      text: reply,
+    };
+  }
+
+  if (intent === 'get_weekly_report') {
+    const topStreak     = Math.max(0, ...state.habits.map(h => h.streak));
+    const topHabit      = state.habits.reduce((a, b) => b.streak > a.streak ? b : a, state.habits[0]);
+    const active        = state.habits.filter(h => !h.paused);
+    const done          = active.filter(h => h.completedToday).length;
+    return {
+      cardType: 'weekly_report',
+      cardData: {
+        hydrationAvgMl:      state.hydration.currentMl,
+        hydrationGoalMl:     state.hydration.goalMl,
+        sleepAvgHours:       state.sleep.weeklyAverage,
+        habitsCompletionPct: active.length > 0 ? Math.round((done / active.length) * 100) : 0,
+        topStreak,
+        topStreakName:       topHabit?.title,
+        period:              'This Week',
+      },
+      text: reply,
+    };
+  }
+
+  if (intent === 'general_health_advice' || intent === 'off_topic') {
+    // Show insight card for advice responses
+    return {
+      cardType: 'insight',
+      cardData: {
+        insight:  reply,
+        category: 'general' as const,
+      },
+      text: '',
+    };
+  }
+
+  return null; // plain text for unknown intents
+}
+
+// ─── Quick action chips ───────────────────────────────────────────
+const QUICK_ACTIONS = [
+  { id: 'summary',  icon: TrendingUp,  label: 'How am I doing?', text: 'How am I doing this week?' },
+  { id: 'water',    icon: Droplets,    label: 'Log water',       text: 'I drank 500ml of water' },
+  { id: 'sleep',    icon: Moon,        label: 'Log sleep',       text: 'I slept 7 hours last night' },
+  { id: 'habit',    icon: Target,      label: 'My habits',       text: 'Show me my habit progress today' },
+  { id: 'meal',     icon: Apple,       label: 'Log meal',        text: 'I had a healthy lunch' },
+  { id: 'insight',  icon: Brain,       label: 'Health insight',  text: 'Give me a health insight based on my patterns' },
+  { id: 'weekly',   icon: TrendingUp,  label: 'Weekly report',   text: 'Show me my weekly health report' },
+] as const;
 
 function formatTime(iso: string) {
   try { return new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }); }
   catch { return ''; }
 }
 
-// ─── Parse AI lines — colored metric rows ────────────────────────
-const METRIC_PATTERNS: { emoji: string; color: string }[] = [
-  { emoji: '💧', color: colors.blue },
-  { emoji: '🌙', color: '#8B5CF6' },
-  { emoji: '🎯', color: colors.emerald },
-  { emoji: '🔴', color: colors.coral },
-  { emoji: '✅', color: colors.emerald },
-  { emoji: '🔥', color: '#F97316' },
-  { emoji: '⚡', color: colors.amber },
-  { emoji: '🏃', color: colors.emerald },
-  { emoji: '📊', color: colors.blue },
-];
+// ─── Rich card router ─────────────────────────────────────────────
+function RichCard({ payload, state }: {
+  payload: RichMessagePayload;
+  state: ReturnType<typeof useHealth>['state'];
+}) {
+  const { cardType, cardData } = payload;
 
-function AIMessageContent({ text }: { text: string }) {
-  const lines = text.split('\n');
-  return (
-    <View style={{ gap: 2 }}>
-      {lines.map((line, i) => {
-        const trimmed = line.trim();
-        if (!trimmed) return <View key={i} style={{ height: 5 }} />;
-        const meta = METRIC_PATTERNS.find(p => trimmed.startsWith(p.emoji));
-        if (meta) {
-          const match = trimmed.match(/^(.*?)\s+([\d.,]+\s*\S*)$/);
-          if (match) {
-            return (
-              <View key={i} style={cs.metricRow}>
-                <Text style={cs.metricLabel}>{match[1]}</Text>
-                <Text style={[cs.metricValue, { color: meta.color }]}>{match[2]}</Text>
-              </View>
-            );
-          }
-        }
-        return <Text key={i} style={cs.bubbleText}>{line}</Text>;
-      })}
-    </View>
-  );
+  if (cardType === 'health_summary')  return <HealthSummaryCard data={cardData as Parameters<typeof HealthSummaryCard>[0]['data']} />;
+  if (cardType === 'hydration_update') return <HydrationCard    data={cardData as Parameters<typeof HydrationCard>[0]['data']} />;
+  if (cardType === 'sleep_update')    return <SleepCard         data={cardData as Parameters<typeof SleepCard>[0]['data']} />;
+  if (cardType === 'habit_progress')  return <HabitProgressCard data={{ ...cardData, habits: cardData.habits ?? state.habits.filter(h => !h.paused) } as Parameters<typeof HabitProgressCard>[0]['data']} />;
+  if (cardType === 'nutrition_log')   return <NutritionCard     data={cardData as Parameters<typeof NutritionCard>[0]['data']} />;
+  if (cardType === 'weekly_report')   return <WeeklyReportCard  data={cardData as Parameters<typeof WeeklyReportCard>[0]['data']} />;
+  if (cardType === 'insight')         return <InsightCard       data={cardData as Parameters<typeof InsightCard>[0]['data']} />;
+  return null;
 }
 
 // ─── Typing dots ──────────────────────────────────────────────────
@@ -105,29 +284,31 @@ function TypingDots() {
     return () => { a1.stop(); a2.stop(); a3.stop(); };
   }, []);
   const dot = (v: Animated.Value) => ({
-    width: 7, height: 7, borderRadius: 3.5, backgroundColor: colors.inkSoft,
-    opacity: v,
+    width: 7, height: 7, borderRadius: 3.5,
+    backgroundColor: colors.inkSoft, opacity: v,
     transform: [{ scale: v.interpolate({ inputRange: [0.25, 1], outputRange: [0.7, 1.1] }) }],
   });
   return (
-    <View style={{ flexDirection: 'row', gap: 5, paddingVertical: 5 }}>
-      <Animated.View style={dot(d1)} /><Animated.View style={dot(d2)} /><Animated.View style={dot(d3)} />
+    <View style={{ flexDirection: 'row', gap: 5, padding: spacing.sm }}>
+      <Animated.View style={dot(d1)} />
+      <Animated.View style={dot(d2)} />
+      <Animated.View style={dot(d3)} />
     </View>
   );
 }
 
-// ─── Waveform bars ────────────────────────────────────────────────
+// ─── Waveform ─────────────────────────────────────────────────────
 function WaveformBars({ active, count = 7 }: { active: boolean; count?: number }) {
-  const bars = useRef(Array.from({ length: count }, () => new Animated.Value(0.15))).current;
-  const PEAKS  = [0.4, 0.7, 0.95, 1.0, 0.9, 0.65, 0.35];
-  const SPEEDS = [380, 280, 320, 260, 340, 300, 420];
+  const bars  = useRef(Array.from({ length: count }, () => new Animated.Value(0.15))).current;
+  const PEAKS = [0.4, 0.7, 0.95, 1.0, 0.9, 0.65, 0.35];
+  const SPD   = [380, 280, 320, 260, 340, 300, 420];
   useEffect(() => {
     if (!active) { bars.forEach(b => b.setValue(0.15)); return; }
     const loops = bars.map((b, i) =>
       Animated.loop(Animated.sequence([
         Animated.delay(i * 60),
-        Animated.timing(b, { toValue: PEAKS[i % PEAKS.length],  duration: SPEEDS[i % SPEEDS.length], easing: Easing.inOut(Easing.ease), useNativeDriver: useND }),
-        Animated.timing(b, { toValue: 0.12, duration: SPEEDS[i % SPEEDS.length] * 0.75, easing: Easing.inOut(Easing.ease), useNativeDriver: useND }),
+        Animated.timing(b, { toValue: PEAKS[i % PEAKS.length], duration: SPD[i % SPD.length], easing: Easing.inOut(Easing.ease), useNativeDriver: useND }),
+        Animated.timing(b, { toValue: 0.12, duration: SPD[i % SPD.length] * 0.75, easing: Easing.inOut(Easing.ease), useNativeDriver: useND }),
       ]))
     );
     loops.forEach(l => l.start());
@@ -148,6 +329,9 @@ function WaveformBars({ active, count = 7 }: { active: boolean; count?: number }
 
 // ─── Voice orb ───────────────────────────────────────────────────
 function VoiceOrb({ active }: { active: boolean }) {
+  // Unique gradient IDs per instance — Android react-native-svg uses a global
+  // gradient registry; duplicate IDs across SVG instances cause wrong renders.
+  const orbId  = useRef(`orb_${Math.random().toString(36).slice(2, 9)}`).current;
   const pulse1 = useRef(new Animated.Value(1)).current;
   const pulse2 = useRef(new Animated.Value(1)).current;
   const glow   = useRef(new Animated.Value(0.3)).current;
@@ -169,64 +353,49 @@ function VoiceOrb({ active }: { active: boolean }) {
     p1.start(); p2.start(); g.start();
     return () => { p1.stop(); p2.stop(); g.stop(); };
   }, [active]);
+
   return (
     <View style={cs.orbWrap}>
       <Animated.View style={[cs.orbRing3, { transform: [{ scale: pulse2 }], opacity: glow.interpolate({ inputRange: [0.3, 0.65], outputRange: [0.12, 0.22] }) }]} />
       <Animated.View style={[cs.orbRing2, { transform: [{ scale: pulse1 }], opacity: glow.interpolate({ inputRange: [0.3, 0.65], outputRange: [0.22, 0.4] }) }]} />
       <Animated.View style={{ transform: [{ scale: pulse1.interpolate({ inputRange: [1, 1.14], outputRange: [1, 1.04] }) }] }}>
-        <Svg width={220} height={220} viewBox="0 0 220 220">
+        <Svg width={200} height={200} viewBox="0 0 200 200">
           <Defs>
-            <RadialGradient id="orbBody" cx="45%" cy="35%" r="65%">
+            <RadialGradient id={`${orbId}_body`} cx="45%" cy="35%" r="65%">
               <Stop offset="0%"   stopColor="#22D3EE" stopOpacity="0.95" />
               <Stop offset="30%"  stopColor="#8B5CF6" stopOpacity="0.8" />
               <Stop offset="65%"  stopColor="#1E1040" stopOpacity="0.95" />
               <Stop offset="100%" stopColor="#060B14" stopOpacity="1" />
             </RadialGradient>
-            <RadialGradient id="orbAmbient" cx="50%" cy="50%" r="50%">
-              <Stop offset="0%"   stopColor="#06B6D4" stopOpacity="0.18" />
-              <Stop offset="60%"  stopColor="#7C3AED" stopOpacity="0.06" />
+            <RadialGradient id={`${orbId}_ambient`} cx="50%" cy="50%" r="50%">
+              <Stop offset="0%"   stopColor="#06B6D4" stopOpacity="0.15" />
               <Stop offset="100%" stopColor="#060B14" stopOpacity="0" />
             </RadialGradient>
-            <SvgLinearGradient id="rimLight" x1="0%" y1="0%" x2="100%" y2="100%">
-              <Stop offset="0%"   stopColor="#06B6D4" stopOpacity="0.5" />
-              <Stop offset="50%"  stopColor="#8B5CF6" stopOpacity="0.2" />
-              <Stop offset="100%" stopColor="#22C55E" stopOpacity="0.1" />
-            </SvgLinearGradient>
           </Defs>
-          <Circle cx={110} cy={110} r={105} fill="url(#orbAmbient)" />
-          <Circle cx={110} cy={110} r={82}  fill="url(#orbBody)" />
-          <Circle cx={110} cy={110} r={82}  fill="none" stroke="url(#rimLight)" strokeWidth={1.5} />
-          <Circle cx={90}  cy={85}  r={22}  fill="#06B6D4" opacity={0.18} />
-          <Circle cx={84}  cy={80}  r={10}  fill="#FFFFFF"  opacity={0.08} />
+          <Circle cx={100} cy={100} r={95}  fill={`url(#${orbId}_ambient)`} />
+          <Circle cx={100} cy={100} r={76}  fill={`url(#${orbId}_body)`} />
+          <Circle cx={100} cy={100} r={76}  fill="none" stroke="#06B6D4" strokeWidth={1} strokeOpacity={0.3} />
+          <Circle cx={82}  cy={78}  r={18}  fill="#06B6D4" opacity={0.15} />
+          <Circle cx={78}  cy={74}  r={9}   fill="#FFFFFF"  opacity={0.07} />
         </Svg>
       </Animated.View>
     </View>
   );
 }
 
-// ─── Full-screen voice overlay ────────────────────────────────────
+// ─── Voice overlay ────────────────────────────────────────────────
 function VoiceOverlay({
-  uiStatus,
-  pendingTranscript,
-  onStop,
-  onCancel,
-  onKeyboard,
-  onConfirm,
-  onRetry,
+  uiStatus, pendingTranscript,
+  onStop, onCancel, onKeyboard, onConfirm, onRetry,
 }: {
-  uiStatus: UIStatus;
-  pendingTranscript: string;
-  onStop:     () => void;
-  onCancel:   () => void;
-  onKeyboard: () => void;
-  onConfirm:  () => void;
-  onRetry:    () => void;
+  uiStatus: UIStatus; pendingTranscript: string;
+  onStop: () => void; onCancel: () => void;
+  onKeyboard: () => void; onConfirm: () => void; onRetry: () => void;
 }) {
   const isListening  = uiStatus === 'listening';
   const isProcessing = uiStatus === 'processing';
   const isConfirming = uiStatus === 'confirming';
 
-  // ── Confirmation card (low-confidence transcript)
   if (isConfirming) {
     return (
       <View style={cs.voiceScreen}>
@@ -265,12 +434,9 @@ function VoiceOverlay({
     );
   }
 
-  // ── Listening / processing view
-  // Tap the orb OR the big bottom button to stop and send
   return (
     <View style={cs.voiceScreen}>
       <SafeAreaView style={{ flex: 1 }}>
-        {/* Top bar */}
         <View style={cs.voiceTopBar}>
           <Sparkles size={15} color={colors.emerald} strokeWidth={2} />
           <Text style={cs.voiceTopTitle}>Aurora</Text>
@@ -279,7 +445,6 @@ function VoiceOverlay({
           </TouchableOpacity>
         </View>
 
-        {/* Orb — tap to stop while listening */}
         <TouchableOpacity
           style={cs.voiceCenter}
           onPress={isListening ? onStop : undefined}
@@ -287,29 +452,26 @@ function VoiceOverlay({
         >
           <VoiceOrb active={isListening} />
           <Text style={cs.voiceStatus}>
-            {isListening  ? "I'm listening..."
+            {isListening   ? "I'm listening..."
             : isProcessing ? 'Processing...'
             : 'Starting...'}
           </Text>
           <Text style={cs.voiceSubtext}>
-            {isListening  ? 'Tap ■ when done, or wait 8s'
+            {isListening   ? 'Tap ■ when done, or wait 8s'
             : isProcessing ? 'Just a moment...'
             : 'Opening microphone...'}
           </Text>
         </TouchableOpacity>
 
-        {/* Waveform */}
         <View style={cs.voiceWaveRow}>
           <WaveformBars active={isListening} count={7} />
         </View>
 
-        {/* Controls: X  |  big STOP/MIC button  |  keyboard */}
         <View style={cs.voiceControls}>
           <TouchableOpacity style={cs.voiceCtrlBtn} onPress={onCancel}>
             <X size={22} color={colors.ink} strokeWidth={2} />
           </TouchableOpacity>
 
-          {/* Big centre button: stop (while listening) or spinner (processing) */}
           <TouchableOpacity
             style={[cs.voiceMicBtn, isProcessing && { backgroundColor: '#334155' }]}
             onPress={isListening ? onStop : undefined}
@@ -329,7 +491,6 @@ function VoiceOverlay({
           </TouchableOpacity>
         </View>
 
-        {/* Tap hint */}
         {isListening && (
           <Text style={cs.voiceTapHint}>Speak now • Tap ■ to send early</Text>
         )}
@@ -338,33 +499,53 @@ function VoiceOverlay({
   );
 }
 
-// ─── Action confirmation banner ───────────────────────────────────
-function ActionBanner({ intent, onDismiss }: { intent: string; onDismiss: () => void }) {
-  const slide = useRef(new Animated.Value(-60)).current;
-  useEffect(() => {
-    Animated.spring(slide, { toValue: 0, useNativeDriver: useND, tension: 180, friction: 14 }).start();
-    const t = setTimeout(() => {
-      Animated.timing(slide, { toValue: -80, duration: 300, useNativeDriver: useND }).start(onDismiss);
-    }, 3000);
-    return () => clearTimeout(t);
-  }, []);
-
-  const label = intent === 'log_water'    ? '💧 Water logged'
-              : intent === 'log_sleep'    ? '🌙 Sleep logged'
-              : intent === 'create_habit' ? '✅ Habit created'
-              : intent === 'log_meal'     ? '🍽 Meal logged'
-              : intent === 'complete_habit' ? '🎯 Habit completed'
-              : null;
-
-  if (!label) return null;
-
+// ─── Empty state ──────────────────────────────────────────────────
+function EmptyState({ name, onChip, busy }: {
+  name: string; onChip: (text: string) => void; busy: boolean;
+}) {
   return (
-    <Animated.View style={[cs.actionBanner, { transform: [{ translateY: slide }] }]}>
-      <Text style={cs.actionBannerText}>{label}</Text>
-      <TouchableOpacity onPress={onDismiss}>
-        <X size={14} color={colors.emerald} strokeWidth={2.5} />
-      </TouchableOpacity>
-    </Animated.View>
+    <View style={cs.emptyState}>
+      <View style={cs.emptyOrbWrap}>
+        <Svg width={96} height={96} viewBox="0 0 96 96">
+          <Defs>
+            <RadialGradient id="eg" cx="50%" cy="50%" r="50%">
+              <Stop offset="0%"   stopColor="#06B6D4" stopOpacity="0.25" />
+              <Stop offset="100%" stopColor="#0D1117" stopOpacity="0" />
+            </RadialGradient>
+          </Defs>
+          <Circle cx={48} cy={48} r={44} fill="url(#eg)" />
+          <Circle cx={48} cy={48} r={30} fill="#151B23" stroke="#1E2835" strokeWidth={1.5} />
+          <Circle cx={48} cy={48} r={20} fill="none"    stroke="#22C55E" strokeWidth={1.5} strokeOpacity={0.5} />
+        </Svg>
+        <View style={cs.emptyOrbIcon}>
+          <Sparkles size={20} color={colors.emerald} strokeWidth={2} />
+        </View>
+      </View>
+
+      <Text style={cs.emptyTitle}>Hi {name || 'there'} 👋</Text>
+      <Text style={cs.emptySubtitle}>
+        I'm Aurora, your personal health companion.{'\n'}
+        Ask me anything or tap a suggestion below.
+      </Text>
+
+      <View style={cs.emptyChips}>
+        {QUICK_ACTIONS.slice(0, 4).map(action => {
+          const Icon = action.icon;
+          return (
+            <TouchableOpacity
+              key={action.id}
+              style={cs.emptyChip}
+              onPress={() => onChip(action.text)}
+              disabled={busy}
+              activeOpacity={0.7}
+            >
+              <Icon size={14} color={colors.emerald} strokeWidth={2.5} />
+              <Text style={cs.emptyChipText}>{action.label}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+    </View>
   );
 }
 
@@ -375,38 +556,35 @@ export function CompanionScreen() {
   const route        = useRoute<any>();
   const launchParams = (route.params ?? {}) as AuroraLaunchParams;
 
-  const [input,              setInput]              = useState('');
-  const [busy,               setBusy]               = useState(false);
-  const [uiStatus,           setUiStatus]           = useState<UIStatus>('idle');
-  const [voiceMode,          setVoiceMode]          = useState(false);
-  const [isSpeaking,         setIsSpeaking]         = useState(false);
-  const [permissionGranted,  setPermissionGranted]  = useState<boolean | null>(null);
-  const [pendingTranscript,  setPendingTranscript]  = useState('');
-  const [lastIntent,         setLastIntent]         = useState<string | null>(null);
-  const [showBanner,         setShowBanner]         = useState(false);
-  const [serverReady,        setServerReady]        = useState<boolean | null>(null);
+  const [input,             setInput]             = useState('');
+  const [busy,              setBusy]              = useState(false);
+  const [uiStatus,          setUiStatus]          = useState<UIStatus>('idle');
+  const [voiceMode,         setVoiceMode]         = useState(false);
+  const [isSpeaking,        setIsSpeaking]        = useState(false);
+  const [permissionGranted, setPermissionGranted] = useState<boolean | null>(null);
+  const [pendingTranscript, setPendingTranscript] = useState('');
+  const [serverReady,       setServerReady]       = useState<boolean | null>(null);
 
   const scrollRef        = useRef<ScrollView>(null);
   const handledLaunchRef = useRef<string | undefined>(undefined);
-  // Store pending pipeline result during confirmation wait
   const pendingResultRef = useRef<{ reply: string; actions: AgentAction[]; intent?: string } | null>(null);
-
-  // runVoicePipeline is defined below but referenced here — use a ref to avoid circular deps
-  const pipelineRef = useRef<((uri: string | null) => Promise<void>) | null>(null);
+  const pipelineRef      = useRef<((uri: string | null) => Promise<void>) | null>(null);
 
   const onAutoStop = useCallback((uri: string | null) => {
-    // Silence-detection fired — skip waiting for manual tap, run pipeline now
     setUiStatus('processing');
     setBusy(true);
     pipelineRef.current?.(uri);
   }, []);
 
-  const { isRecording, requestPermission, startRecording: recorderStart, stopRecording: recorderStop } = useVoiceRecorder(onAutoStop);
+  const {
+    isRecording,
+    requestPermission,
+    startRecording: recorderStart,
+    stopRecording: recorderStop,
+  } = useVoiceRecorder(onAutoStop);
 
-  // Request mic permission + ping server on mount
   useEffect(() => {
     requestPermission().then(ok => setPermissionGranted(ok)).catch(() => setPermissionGranted(false));
-    // Wake up Render server in background — free tier sleeps after 15min
     pingServer().then(ok => setServerReady(ok)).catch(() => setServerReady(false));
   }, []);
 
@@ -415,27 +593,28 @@ export function CompanionScreen() {
     return () => clearTimeout(t);
   }, [state.chatMessages.length, busy]);
 
-  // ── TTS ──────────────────────────────────────────────────────────
+  // ── TTS ─────────────────────────────────────────────────────────
   const speak = useCallback((text: string) => {
     Speech.stop();
+    if (!text.trim()) return;
     setIsSpeaking(true);
     setUiStatus('speaking');
-    const sentences = text.match(/[^.!?…]+[.!?…]+/g)?.map(s => s.trim()).filter(Boolean) ?? [text];
-    const speakNext = (idx: number) => {
-      if (idx >= sentences.length) { setIsSpeaking(false); setUiStatus('idle'); return; }
-      Speech.speak(sentences[idx], {
-        rate: 0.88, pitch: 1.06, language: 'en-US',
-        onDone:    () => speakNext(idx + 1),
-        onError:   () => { setIsSpeaking(false); setUiStatus('idle'); },
-        onStopped: () => { setIsSpeaking(false); setUiStatus('idle'); },
-      });
-    };
-    speakNext(0);
+    // Speak the full text as a single utterance — Android TTS engines have
+    // unreliable onDone callbacks when chaining multiple Speech.speak() calls,
+    // causing playback to stop after the first sentence. One call is reliable.
+    Speech.speak(text, {
+      rate: 0.88, pitch: 1.06, language: 'en-US',
+      onDone:    () => { setIsSpeaking(false); setUiStatus('idle'); },
+      onError:   () => { setIsSpeaking(false); setUiStatus('idle'); },
+      onStopped: () => { setIsSpeaking(false); setUiStatus('idle'); },
+    });
   }, []);
 
-  const stopSpeaking = useCallback(() => { Speech.stop(); setIsSpeaking(false); setUiStatus('idle'); }, []);
+  const stopSpeaking = useCallback(() => {
+    Speech.stop(); setIsSpeaking(false); setUiStatus('idle');
+  }, []);
 
-  // ── Sync chat message to Supabase ─────────────────────────────────
+  // ── Sync to Supabase ─────────────────────────────────────────────
   const syncMessage = useCallback(async (role: 'user' | 'assistant', content: string) => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
@@ -444,18 +623,34 @@ export function CompanionScreen() {
     } catch { /* non-critical */ }
   }, []);
 
-  // ── Apply pipeline result ─────────────────────────────────────────
-  const applyResult = useCallback((reply: string, actions: AgentAction[] = [], intent?: string) => {
-    applyAgentActions(actions);
-    addChatMessage({ role: 'assistant', content: reply });
-    syncMessage('assistant', reply);
-    if (intent) { setLastIntent(intent); setShowBanner(true); }
-    setServerReady(true); // server responded successfully
-    setBusy(false);
-    speak(reply);
-  }, [applyAgentActions, addChatMessage, syncMessage, speak]);
+  // ── Compose and add an AI message (with optional rich card) ─────
+  const addAiMessage = useCallback((
+    reply: string,
+    actions: AgentAction[],
+    intent: string | undefined,
+  ) => {
+    const richPayload = buildRichPayload(intent, actions, reply, state);
+    const content = richPayload ? encodeCard(richPayload) : reply;
+    addChatMessage({ role: 'assistant', content });
+    syncMessage('assistant', content);
+  }, [state, addChatMessage, syncMessage]);
 
-  // ── Send text ─────────────────────────────────────────────────────
+  // ── Apply result ─────────────────────────────────────────────────
+  const applyResult = useCallback((
+    reply: string,
+    actions: AgentAction[] = [],
+    intent?: string,
+  ) => {
+    applyAgentActions(actions);
+    addAiMessage(reply, actions, intent);
+    setServerReady(true);
+    setBusy(false);
+    // Only speak the text portion, not the card JSON
+    const textToSpeak = reply.length > 0 ? reply : '';
+    if (textToSpeak) speak(textToSpeak);
+  }, [applyAgentActions, addAiMessage, speak]);
+
+  // ── Send text ────────────────────────────────────────────────────
   const sendText = useCallback(async (message?: string) => {
     const msg = (message ?? input).trim();
     if (!msg || busy) return;
@@ -468,11 +663,11 @@ export function CompanionScreen() {
       const res = await sendAgentText(msg, state);
       applyResult(res.reply, res.actions, res.intent);
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : '';
-      const isTimeout = errMsg.includes('timed out') || errMsg.includes('waking up');
-      const fallback = isTimeout
-        ? "The server is waking up from sleep. Wait 30 seconds and try again."
-        : "Couldn't reach the Aurora server. Check your connection and try again.";
+      const errMsg  = err instanceof Error ? err.message : '';
+      const timeout = errMsg.includes('timed out') || errMsg.includes('waking up');
+      const fallback = timeout
+        ? 'The server is waking up from sleep — give it 30 seconds and try again.'
+        : "I couldn't reach the server. Check your connection and try again.";
       addChatMessage({ role: 'assistant', content: fallback });
       speak(fallback);
       setBusy(false);
@@ -481,37 +676,28 @@ export function CompanionScreen() {
     }
   }, [input, busy, state, addChatMessage, syncMessage, applyResult, speak]);
 
-  // ── Start recording ───────────────────────────────────────────────
+  // ── Start recording ──────────────────────────────────────────────
   const startRecording = useCallback(async () => {
     if (busy || isRecording) return;
     if (isSpeaking) stopSpeaking();
-
-    // Ensure permission
-    let hasPermission = permissionGranted;
-    if (!hasPermission) {
-      hasPermission = await requestPermission();
-      setPermissionGranted(hasPermission);
+    let hasPerm = permissionGranted;
+    if (!hasPerm) {
+      hasPerm = await requestPermission();
+      setPermissionGranted(hasPerm);
     }
-    if (!hasPermission) {
+    if (!hasPerm) {
       Alert.alert('Microphone needed', 'Enable microphone access in Settings to use voice.');
       return;
     }
-
     setVoiceMode(true);
-    setUiStatus('idle'); // show "Starting..." until mic actually opens
+    setUiStatus('idle');
     const ok = await recorderStart();
-    if (ok) {
-      setUiStatus('listening');
-    } else {
-      setVoiceMode(false);
-      setUiStatus('idle');
-      Alert.alert('Could not start recording', 'Check microphone permissions and try again.');
-    }
+    if (ok) { setUiStatus('listening'); }
+    else    { setVoiceMode(false); setUiStatus('idle'); Alert.alert('Could not start recording', 'Check microphone permissions and try again.'); }
   }, [busy, isRecording, isSpeaking, stopSpeaking, permissionGranted, requestPermission, recorderStart]);
 
-  // ── Core voice pipeline — called by both manual stop and auto-stop ──
+  // ── Voice pipeline ───────────────────────────────────────────────
   const runVoicePipeline = useCallback(async (uri: string | null) => {
-    // Always close overlay and reset state at the end
     const done = (opts?: { keepBusy?: boolean }) => {
       setVoiceMode(false);
       setUiStatus('idle');
@@ -523,13 +709,13 @@ export function CompanionScreen() {
     try {
       const res = await sendAgentVoice(uri, state);
 
-      // Server couldn't get audio or transcript — close overlay silently, user retries
-      if (res.error === 'no_audio' || res.error === 'no_transcript' || res.error === 'unclear' || res.error === 'low_confidence') {
+      if (res.error === 'no_audio' || res.error === 'no_transcript') {
         done();
+        addChatMessage({ role: 'assistant', content: "I didn't catch that. Try speaking closer to the microphone, or type your message." });
         return;
       }
+      if (res.error === 'unclear' || res.error === 'low_confidence') { done(); return; }
 
-      // Low confidence — show confirmation card (still inside overlay)
       if (res.needsConfirmation && res.transcript) {
         setPendingTranscript(res.transcript);
         pendingResultRef.current = {
@@ -537,32 +723,28 @@ export function CompanionScreen() {
           actions: res.actions ?? [],
           intent:  res.intent,
         };
-        setVoiceMode(true); // keep overlay open
+        setVoiceMode(true);
         setUiStatus('confirming');
         setBusy(false);
         return;
       }
 
-      // Success — close overlay FIRST then show messages
+      // Success — close overlay FIRST, then add messages
       done({ keepBusy: true });
-
       if (res.transcript) {
         addChatMessage({ role: 'user', content: res.transcript });
         syncMessage('user', res.transcript);
       }
-
       if (res.reply) {
         applyResult(res.reply, res.actions ?? [], res.intent);
       } else {
         setBusy(false);
       }
-
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      console.error('[Aurora] Voice pipeline error:', errMsg);
       done();
-      const isTimeout = errMsg.includes('timed out') || errMsg.includes('waking up');
-      const fallback = isTimeout
+      const timeout = errMsg.includes('timed out') || errMsg.includes('waking up');
+      const fallback = timeout
         ? 'The server is waking up. Wait a moment and try again.'
         : "Couldn't reach the server. Check your connection.";
       addChatMessage({ role: 'assistant', content: fallback });
@@ -571,26 +753,24 @@ export function CompanionScreen() {
     }
   }, [state, addChatMessage, syncMessage, applyResult, speak]);
 
-  // Keep ref in sync so onAutoStop (created before runVoicePipeline) can call it
   useEffect(() => { pipelineRef.current = runVoicePipeline; }, [runVoicePipeline]);
 
-  // ── Manual stop (user taps button/orb) ────────────────────────────
+  // ── Manual stop ──────────────────────────────────────────────────
   const stopRecording = useCallback(async () => {
-    if (!isRecording) return; // already stopped by auto-stop
+    if (!isRecording) return;
     setUiStatus('processing');
     setBusy(true);
     const uri = await recorderStop();
     if (uri) {
       await runVoicePipeline(uri);
     } else {
-      // Auto-stop already handled it, or no audio was captured
       setVoiceMode(false);
       setBusy(false);
       setUiStatus('idle');
     }
   }, [isRecording, recorderStop, runVoicePipeline]);
 
-  // ── Confirm pending transcript ────────────────────────────────────
+  // ── Confirm transcript ───────────────────────────────────────────
   const confirmTranscript = useCallback(() => {
     setVoiceMode(false);
     const pending = pendingResultRef.current;
@@ -608,7 +788,7 @@ export function CompanionScreen() {
     pendingResultRef.current = null;
   }, [pendingTranscript, addChatMessage, syncMessage, applyResult]);
 
-  // ── Retry from confirmation ───────────────────────────────────────
+  // ── Retry ────────────────────────────────────────────────────────
   const retryRecording = useCallback(async () => {
     setPendingTranscript('');
     pendingResultRef.current = null;
@@ -620,7 +800,7 @@ export function CompanionScreen() {
     }, 300);
   }, [recorderStart]);
 
-  // ── Cancel voice entirely ─────────────────────────────────────────
+  // ── Cancel ───────────────────────────────────────────────────────
   const cancelVoice = useCallback(async () => {
     try { if (isRecording) await recorderStop(); } catch { /* ignore */ }
     setPendingTranscript('');
@@ -630,7 +810,7 @@ export function CompanionScreen() {
     setBusy(false);
   }, [isRecording, recorderStop]);
 
-  // ── Auto-start from HomeScreen "Talk to Aurora" button ───────────
+  // ── Auto-start from HomeScreen "Talk to Aurora" ──────────────────
   useEffect(() => {
     const launchId = launchParams.launchId;
     if (!launchParams.autoStartVoice || !launchId || handledLaunchRef.current === launchId) return;
@@ -640,33 +820,45 @@ export function CompanionScreen() {
     return () => clearTimeout(t);
   }, [busy, isRecording, launchParams, uiStatus, startRecording]);
 
+  // ─────────────────────────────────────────────────────────────────
   const messages    = state.chatMessages.slice(1);
   const hasMessages = messages.length > 0;
   const isWorking   = uiStatus === 'processing';
 
   return (
     <SafeAreaView style={cs.screen}>
+      {/* Voice overlay modal — transparent={true} so SafeAreaView inside
+          receives correct insets on Android (with transparent={false} the
+          statusBarTranslucent prop is silently ignored and content shifts
+          under the status bar on many Android devices). */}
+      <Modal visible={voiceMode} animationType="fade" transparent={true} statusBarTranslucent>
+        <VoiceOverlay
+          uiStatus={uiStatus}
+          pendingTranscript={pendingTranscript}
+          onStop={stopRecording}
+          onCancel={cancelVoice}
+          onKeyboard={cancelVoice}
+          onConfirm={confirmTranscript}
+          onRetry={retryRecording}
+        />
+      </Modal>
 
-      {/* ── Server offline banner ── */}
+      {/* Offline banner */}
       {serverReady === false && (
         <View style={cs.offlineBanner}>
-          <Text style={cs.offlineBannerText}>⚠ Server is waking up — first message may take 30s</Text>
+          <Text style={cs.offlineBannerText}>⚠ Server waking up — first message may take 30s</Text>
         </View>
       )}
 
-      {/* ── Action confirmation banner ── */}
-      {showBanner && lastIntent && (
-        <ActionBanner intent={lastIntent} onDismiss={() => setShowBanner(false)} />
-      )}
-
-      {/* ── Header ── */}
+      {/* Header */}
       <View style={cs.header}>
         <TouchableOpacity onPress={() => navigation.goBack()} style={cs.iconBtn}>
           <ChevronLeft size={20} color={colors.ink} strokeWidth={2.5} />
         </TouchableOpacity>
+
         <View style={cs.headerCenter}>
           <View style={cs.headerTitleRow}>
-            <Sparkles size={14} color={colors.emerald} strokeWidth={2} />
+            <View style={cs.auroraIndicator} />
             <Text style={cs.headerTitle}>Aurora</Text>
             {uiStatus !== 'idle' && (
               <View style={cs.statusPill}>
@@ -679,8 +871,9 @@ export function CompanionScreen() {
               </View>
             )}
           </View>
-          <Text style={cs.headerSubtitle}>Your AI Health Companion</Text>
+          <Text style={cs.headerSubtitle}>AI Health Companion</Text>
         </View>
+
         <TouchableOpacity
           onPress={isSpeaking ? stopSpeaking : undefined}
           style={[cs.iconBtn, isSpeaking && cs.iconBtnActive]}
@@ -691,293 +884,672 @@ export function CompanionScreen() {
 
       <KeyboardAvoidingView
         style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={0}
+        behavior="padding"
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
       >
+        {/* Messages */}
+        <ScrollView
+          ref={scrollRef}
+          showsVerticalScrollIndicator={false}
+          style={cs.messageScroll}
+          contentContainerStyle={[cs.messages, !hasMessages && cs.messagesCenter]}
+        >
+          {!hasMessages && (
+            <EmptyState
+              name={state.user.name}
+              onChip={sendText}
+              busy={busy}
+            />
+          )}
 
-      {/* ── Messages ── */}
-      <ScrollView
-        ref={scrollRef}
-        showsVerticalScrollIndicator={false}
-        style={cs.messageScroll}
-        contentContainerStyle={[cs.messages, !hasMessages && cs.messagesCenter]}
-      >
-        {!hasMessages && (
-          <View style={cs.emptyState}>
-            <Svg width={160} height={160} viewBox="0 0 160 160">
-              <Defs>
-                <RadialGradient id="emptyGlow" cx="50%" cy="50%" r="50%">
-                  <Stop offset="0%"   stopColor="#06B6D4" stopOpacity="0.28" />
-                  <Stop offset="60%"  stopColor="#8B5CF6" stopOpacity="0.08" />
-                  <Stop offset="100%" stopColor="#090D14" stopOpacity="0" />
-                </RadialGradient>
-                <SvgLinearGradient id="emptyRing" x1="0%" y1="0%" x2="100%" y2="100%">
-                  <Stop offset="0%"   stopColor="#06B6D4" />
-                  <Stop offset="50%"  stopColor="#8B7BFF" />
-                  <Stop offset="100%" stopColor="#22C55E" />
-                </SvgLinearGradient>
-              </Defs>
-              <Circle cx={80} cy={80} r={75} fill="url(#emptyGlow)" />
-              <Circle cx={80} cy={80} r={58} fill="none" stroke="url(#emptyRing)" strokeWidth={1.5} strokeDasharray="8 6 12 8" opacity={0.5} transform="rotate(15 80 80)" />
-              <Circle cx={80} cy={80} r={44} fill="none" stroke="url(#emptyRing)" strokeWidth={1}   strokeDasharray="5 7 3 5"  opacity={0.3} transform="rotate(-45 80 80)" />
-              <Circle cx={80} cy={80} r={30} fill="#111622" stroke="#1D2433" strokeWidth={1.5} />
-              <Circle cx={80} cy={80} r={22} fill="none" stroke="#22C55E" strokeWidth={1.5} opacity={0.4} />
-            </Svg>
-            <Text style={cs.emptyTitle}>How can I help you?</Text>
-            <Text style={cs.emptySubtitle}>Log water, sleep, habits, meals — or ask anything about your health.</Text>
-            <View style={cs.emptyChips}>
-              {ALL_CHIPS.slice(0, 3).map(chip => (
-                <TouchableOpacity key={chip.id} onPress={() => sendText(chip.text)} style={cs.emptyChip} disabled={busy}>
-                  <Text style={cs.emptyChipEmoji}>{chip.emoji}</Text>
-                  <Text style={cs.emptyChipText}>{chip.label}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          </View>
-        )}
+          {messages.map((msg, idx, arr) => {
+            const isLast = idx === arr.length - 1;
+            const isUser = msg.role === 'user';
+            const time   = formatTime(msg.createdAt);
 
-        {messages.map((msg, idx, arr) => {
-          const isLast = idx === arr.length - 1;
-          const isUser = msg.role === 'user';
-          const time   = formatTime(msg.createdAt);
-
-          if (isUser) {
-            return (
-              <View key={msg.id} style={cs.userRow}>
-                <View style={cs.userBubble}>
-                  <Text style={cs.userBubbleText}>{msg.content}</Text>
+            if (isUser) {
+              return (
+                <View key={msg.id} style={cs.userRow}>
+                  <View style={cs.userBubble}>
+                    <Text style={cs.userBubbleText}>{msg.content}</Text>
+                  </View>
+                  <View style={cs.userMeta}>
+                    <Text style={cs.metaTime}>{time}</Text>
+                    {isLast && <Text style={cs.readReceipt}>✓✓</Text>}
+                  </View>
                 </View>
-                <View style={cs.userMeta}>
-                  <Text style={cs.metaTime}>{time}</Text>
-                  {isLast && <Text style={cs.readReceipt}>✓✓</Text>}
+              );
+            }
+
+            // AI message — try to decode a rich card
+            const decoded = decodeCard(msg.content);
+
+            return (
+              <View key={msg.id} style={cs.aiRow}>
+                {/* Avatar */}
+                <View style={cs.aiAvatarCol}>
+                  <View style={cs.aiAvatar}>
+                    <Sparkles size={13} color={colors.background} strokeWidth={2.5} />
+                  </View>
+                </View>
+
+                {/* Content */}
+                <View style={cs.aiBubbleCol}>
+                  {decoded ? (
+                    <>
+                      {/* Rich card */}
+                      <RichCard payload={decoded.payload} state={state} />
+                      {/* Natural language reply below the card */}
+                      {decoded.text.trim().length > 0 && (
+                        <View style={cs.aiTextBubble}>
+                          <Text style={cs.bubbleText}>{decoded.text}</Text>
+                        </View>
+                      )}
+                    </>
+                  ) : (
+                    <View style={cs.aiTextBubble}>
+                      <Text style={cs.bubbleText}>{msg.content}</Text>
+                    </View>
+                  )}
+
+                  <View style={cs.aiMeta}>
+                    <Text style={cs.metaTime}>{time}</Text>
+                    <TouchableOpacity
+                      style={cs.copyBtn}
+                      onPress={() => {/* clipboard */}}
+                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    >
+                      <Copy size={11} color={colors.muted} strokeWidth={2} />
+                    </TouchableOpacity>
+                  </View>
                 </View>
               </View>
             );
-          }
+          })}
 
-          return (
-            <View key={msg.id} style={cs.aiRow}>
-              <View style={cs.aiAvatar}>
-                <Sparkles size={11} color={colors.background} strokeWidth={2.5} />
+          {/* Typing indicator */}
+          {isWorking && (
+            <View style={cs.aiRow}>
+              <View style={cs.aiAvatarCol}>
+                <View style={cs.aiAvatar}>
+                  <Sparkles size={13} color={colors.background} strokeWidth={2.5} />
+                </View>
               </View>
               <View style={cs.aiBubbleCol}>
-                <View style={cs.aiBubble}>
-                  <AIMessageContent text={msg.content} />
-                </View>
-                <View style={cs.aiMeta}>
-                  <Text style={cs.metaTime}>{time}</Text>
-                  <TouchableOpacity style={cs.copyBtn} onPress={() => {}}>
-                    <Copy size={12} color={colors.subtle} strokeWidth={2} />
-                  </TouchableOpacity>
+                <View style={cs.aiTextBubble}>
+                  <TypingDots />
                 </View>
               </View>
             </View>
-          );
-        })}
-
-        {isWorking && (
-          <View style={cs.aiRow}>
-            <View style={cs.aiAvatar}>
-              <Sparkles size={11} color={colors.background} strokeWidth={2.5} />
-            </View>
-            <View style={cs.aiBubble}>
-              <TypingDots />
-            </View>
-          </View>
-        )}
-      </ScrollView>
-
-      {/* ── Quick chips ── */}
-      {hasMessages && !busy && (
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={cs.chipsScroll} contentContainerStyle={cs.chipsContent}>
-          {ALL_CHIPS.map(chip => (
-            <TouchableOpacity key={chip.id} onPress={() => sendText(chip.text)} style={cs.chip} disabled={busy}>
-              <Text style={cs.chipEmoji}>{chip.emoji}</Text>
-              <Text style={cs.chipLabel}>{chip.label}</Text>
-            </TouchableOpacity>
-          ))}
+          )}
         </ScrollView>
-      )}
 
-      {/* ── Composer ── */}
-      <View style={cs.composerWrap}>
-        <View style={cs.composer}>
-          <TouchableOpacity onPress={startRecording} disabled={busy} style={[cs.micBtn, busy && { opacity: 0.5 }]}>
-            <Mic size={20} color={colors.background} strokeWidth={2.5} />
-          </TouchableOpacity>
-          <TextInput
-            value={input}
-            onChangeText={setInput}
-            placeholder="Type a message..."
-            placeholderTextColor={colors.subtle}
-            style={cs.textInput}
-            multiline
-            maxLength={600}
-            editable={!busy}
-          />
-          <TouchableOpacity
-            onPress={() => sendText()}
-            disabled={!input.trim() || busy}
-            style={[cs.sendBtn, input.trim() && !busy && cs.sendBtnActive]}
+        {/* Quick action chips — shown only when no messages */}
+        {!hasMessages && (
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            style={cs.chipsScroll}
+            contentContainerStyle={cs.chipsContent}
           >
-            <Send size={16} color={input.trim() && !busy ? colors.background : colors.subtle} strokeWidth={2.2} />
-          </TouchableOpacity>
+            {QUICK_ACTIONS.map(action => {
+              const Icon = action.icon;
+              return (
+                <TouchableOpacity
+                  key={action.id}
+                  style={cs.chip}
+                  onPress={() => sendText(action.text)}
+                  disabled={busy}
+                  activeOpacity={0.7}
+                >
+                  <Icon size={12} color={colors.emerald} strokeWidth={2.5} />
+                  <Text style={cs.chipLabel}>{action.label}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+        )}
+
+        {/* Composer */}
+        <View style={cs.composerWrap}>
+          <View style={cs.composer}>
+            <TextInput
+              style={cs.textInput}
+              placeholder="Message Aurora..."
+              placeholderTextColor={colors.muted}
+              value={input}
+              onChangeText={setInput}
+              onSubmitEditing={() => sendText()}
+              returnKeyType="send"
+              multiline
+              maxLength={500}
+              editable={!busy}
+            />
+
+            {/* Mic button */}
+            <TouchableOpacity
+              style={[cs.composerBtn, isRecording && cs.composerBtnActive]}
+              onPress={voiceMode ? stopRecording : startRecording}
+              disabled={busy && !isRecording}
+              activeOpacity={0.75}
+            >
+              <Mic size={18} color={voiceMode ? colors.emerald : colors.inkSoft} strokeWidth={2.5} />
+            </TouchableOpacity>
+
+            {/* Send button */}
+            <TouchableOpacity
+              style={[cs.sendBtn, input.trim().length > 0 && cs.sendBtnActive]}
+              onPress={() => sendText()}
+              disabled={!input.trim() || busy}
+              activeOpacity={0.75}
+            >
+              <Send size={16} color={input.trim() ? colors.background : colors.muted} strokeWidth={2.5} />
+            </TouchableOpacity>
+          </View>
         </View>
-      </View>
-
       </KeyboardAvoidingView>
-
-      {/* ── Full-screen voice overlay ── */}
-      <Modal visible={voiceMode} transparent={false} animationType="fade" statusBarTranslucent onRequestClose={cancelVoice}>
-        <VoiceOverlay
-          uiStatus={uiStatus}
-          pendingTranscript={pendingTranscript}
-          onStop={stopRecording}
-          onCancel={cancelVoice}
-          onKeyboard={cancelVoice}
-          onConfirm={confirmTranscript}
-          onRetry={retryRecording}
-        />
-      </Modal>
     </SafeAreaView>
   );
 }
 
 // ─── Styles ───────────────────────────────────────────────────────
+
 const cs = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: '#0D1117' },
+  screen: {
+    flex: 1,
+    backgroundColor: colors.background,
+  },
 
-  // Server offline banner
+  // ── Banners ────────────────────────────────────────────────────
   offlineBanner: {
-    backgroundColor: '#7C2D12', paddingHorizontal: spacing.lg, paddingVertical: 8,
-    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: '#7C2D12',
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.sm,
+    alignItems: 'center',
   },
-  offlineBannerText: { color: '#FED7AA', fontSize: 12, fontWeight: fontWeight.bold, flex: 1, textAlign: 'center' },
-
-  // Action banner
-  actionBanner: {
-    position: 'absolute', top: 0, left: 0, right: 0, zIndex: 999,
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: `${colors.emerald}22`,
-    borderBottomWidth: 1, borderBottomColor: `${colors.emerald}33`,
-    paddingHorizontal: spacing.lg, paddingVertical: spacing.sm,
+  offlineBannerText: {
+    fontSize: type.micro,
+    color: '#FED7AA',
+    fontWeight: fontWeight.medium,
   },
-  actionBannerText: { color: colors.emerald, fontSize: type.small, fontWeight: fontWeight.black },
 
-  // Header
+  // ── Header ─────────────────────────────────────────────────────
   header: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingHorizontal: spacing.lg, paddingVertical: spacing.sm,
-    backgroundColor: '#0D1117', borderBottomWidth: 1, borderBottomColor: '#161D27',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    backgroundColor: colors.background,
   },
   iconBtn: {
-    width: 38, height: 38, borderRadius: radius.md,
-    borderWidth: 1, borderColor: '#1E2835', backgroundColor: '#131A23',
-    alignItems: 'center', justifyContent: 'center',
+    width: 36,
+    height: 36,
+    borderRadius: radius.sm,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  iconBtnActive:    { borderColor: colors.emerald },
-  headerCenter:     { alignItems: 'center', gap: 1 },
-  headerTitleRow:   { flexDirection: 'row', alignItems: 'center', gap: 5 },
-  headerTitle:      { color: colors.ink, fontSize: type.body, fontWeight: fontWeight.black },
-  headerSubtitle:   { color: '#4A5568', fontSize: 11, fontWeight: fontWeight.medium, letterSpacing: 0.2 },
+  iconBtnActive: {
+    borderColor: colors.emerald + '66',
+    backgroundColor: colors.emeraldSoft,
+  },
+  headerCenter: {
+    flex: 1,
+    alignItems: 'center',
+    gap: 2,
+  },
+  headerTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+  },
+  auroraIndicator: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+    backgroundColor: colors.emerald,
+  },
+  headerTitle: {
+    fontSize: type.body,
+    fontWeight: fontWeight.bold,
+    color: colors.ink,
+    letterSpacing: 0.2,
+  },
+  headerSubtitle: {
+    fontSize: type.micro,
+    color: colors.muted,
+    fontWeight: fontWeight.medium,
+  },
   statusPill: {
-    backgroundColor: `${colors.emerald}22`, borderRadius: radius.full,
-    paddingHorizontal: 7, paddingVertical: 2, marginLeft: 4,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
+    borderRadius: radius.full,
+    backgroundColor: colors.emeraldSoft,
+    borderWidth: 1,
+    borderColor: colors.emeraldGlow,
   },
-  statusText: { color: colors.emerald, fontSize: 9, fontWeight: fontWeight.black, letterSpacing: 0.5, textTransform: 'uppercase' },
+  statusText: {
+    fontSize: 10,
+    color: colors.emerald,
+    fontWeight: fontWeight.bold,
+    letterSpacing: 0.4,
+  },
 
-  // Messages
-  messageScroll: { flex: 1, backgroundColor: '#0D1117' },
-  messages:      { paddingHorizontal: spacing.md, paddingTop: spacing.lg, paddingBottom: spacing.sm, gap: 14 },
-  messagesCenter: { flexGrow: 1, justifyContent: 'center' },
+  // ── Messages ───────────────────────────────────────────────────
+  messageScroll: {
+    flex: 1,
+    backgroundColor: colors.background,
+  },
+  messages: {
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.lg,
+    paddingBottom: spacing.md,
+    gap: spacing.md,
+  },
+  messagesCenter: {
+    flexGrow: 1,
+    justifyContent: 'center',
+  },
 
-  // Empty state
-  emptyState:    { alignItems: 'center', gap: spacing.lg, paddingVertical: spacing.xl },
-  emptyTitle:    { color: colors.ink, fontSize: 20, fontWeight: fontWeight.black, textAlign: 'center' },
-  emptySubtitle: { color: '#4A5568', fontSize: type.small, textAlign: 'center', lineHeight: 20, paddingHorizontal: spacing.lg },
-  emptyChips:    { width: '100%', gap: spacing.sm },
+  // ── Empty state ────────────────────────────────────────────────
+  emptyState: {
+    alignItems: 'center',
+    gap: spacing.lg,
+    paddingHorizontal: spacing.xl,
+  },
+  emptyOrbWrap: {
+    position: 'relative',
+    width: 96,
+    height: 96,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emptyOrbIcon: {
+    position: 'absolute',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emptyTitle: {
+    fontSize: type.section,
+    fontWeight: fontWeight.bold,
+    color: colors.ink,
+    textAlign: 'center',
+  },
+  emptySubtitle: {
+    fontSize: type.small,
+    color: colors.inkSoft,
+    textAlign: 'center',
+    lineHeight: 20,
+  },
+  emptyChips: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: spacing.sm,
+    justifyContent: 'center',
+  },
   emptyChip: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing.sm,
-    backgroundColor: '#131A23', borderWidth: 1, borderColor: '#1E2835',
-    borderRadius: radius.md, paddingVertical: spacing.md, paddingHorizontal: spacing.lg,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderRadius: radius.full,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
   },
-  emptyChipEmoji: { fontSize: 16 },
-  emptyChipText:  { color: colors.inkSoft, fontSize: type.small, fontWeight: fontWeight.bold },
-
-  // User bubbles
-  userRow:      { alignItems: 'flex-end', gap: 4, alignSelf: 'flex-end', maxWidth: '80%' },
-  userBubble:   { backgroundColor: '#1A6B3C', borderRadius: 18, borderBottomRightRadius: 4, paddingHorizontal: 14, paddingVertical: 10 },
-  userBubbleText: { color: colors.ink, fontSize: type.body, lineHeight: 22, fontWeight: fontWeight.medium },
-  userMeta:     { flexDirection: 'row', alignItems: 'center', gap: 4, paddingRight: 2 },
-
-  // AI bubbles
-  aiRow:       { flexDirection: 'row', alignItems: 'flex-start', gap: 8, maxWidth: '88%' },
-  aiAvatar:    {
-    width: 26, height: 26, borderRadius: 13, backgroundColor: '#22C55E',
-    alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: 2,
+  emptyChipText: {
+    fontSize: type.small,
+    color: colors.inkSoft,
+    fontWeight: fontWeight.medium,
   },
-  aiBubbleCol: { flex: 1, gap: 4 },
-  aiBubble: {
-    backgroundColor: '#131A23', borderRadius: 18, borderTopLeftRadius: 4,
-    borderWidth: 1, borderColor: '#1E2835', paddingHorizontal: 14, paddingVertical: 12,
+
+  // ── User message ───────────────────────────────────────────────
+  userRow: {
+    alignItems: 'flex-end',
+    gap: 4,
   },
-  aiMeta:  { flexDirection: 'row', alignItems: 'center', gap: 6, paddingLeft: 2 },
-  copyBtn: { padding: 2 },
+  userBubble: {
+    backgroundColor: '#1A3A2A',
+    borderRadius: radius.xl,
+    borderBottomRightRadius: radius.xs,
+    borderWidth: 1,
+    borderColor: colors.emerald + '33',
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    maxWidth: '80%',
+  },
+  userBubbleText: {
+    fontSize: type.small,
+    color: colors.ink,
+    lineHeight: 20,
+    fontWeight: fontWeight.medium,
+  },
+  userMeta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    paddingRight: spacing.xs,
+  },
 
-  // Shared meta
-  metaTime:    { color: '#334155', fontSize: 10, fontWeight: fontWeight.medium },
-  readReceipt: { color: colors.emerald, fontSize: 10, fontWeight: fontWeight.black },
-  bubbleText:  { color: '#CBD5E1', fontSize: type.body, lineHeight: 23, fontWeight: fontWeight.medium },
+  // ── AI message ─────────────────────────────────────────────────
+  aiRow: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+    alignItems: 'flex-start',
+  },
+  aiAvatarCol: {
+    paddingTop: 3,
+  },
+  aiAvatar: {
+    width: 28,
+    height: 28,
+    borderRadius: radius.sm,
+    backgroundColor: colors.emerald,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...shadow,
+  },
+  aiBubbleCol: {
+    flex: 1,
+    gap: spacing.xs,
+  },
+  aiTextBubble: {
+    backgroundColor: colors.surface,
+    borderRadius: radius.xl,
+    borderTopLeftRadius: radius.xs,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    maxWidth: '100%',
+  },
+  aiMeta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingLeft: spacing.xs,
+  },
+  bubbleText: {
+    fontSize: type.small,
+    color: colors.inkSoft,
+    lineHeight: 20,
+  },
+  metaTime: {
+    fontSize: type.micro,
+    color: colors.subtle,
+    fontWeight: fontWeight.medium,
+  },
+  readReceipt: {
+    fontSize: type.micro,
+    color: colors.emerald,
+    fontWeight: fontWeight.medium,
+  },
+  copyBtn: {
+    padding: 3,
+  },
 
-  // Metric rows
-  metricRow:   { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: '#1E2835', marginVertical: 1 },
-  metricLabel: { color: '#94A3B8', fontSize: type.body, fontWeight: fontWeight.medium, flex: 1 },
-  metricValue: { fontSize: type.body, fontWeight: fontWeight.black, marginLeft: 8 },
+  // ── Chips ──────────────────────────────────────────────────────
+  chipsScroll: {
+    backgroundColor: colors.background,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    maxHeight: 52,
+  },
+  chipsContent: {
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.sm,
+    gap: spacing.sm,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderRadius: radius.full,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  chipLabel: {
+    fontSize: type.micro,
+    color: colors.inkSoft,
+    fontWeight: fontWeight.medium,
+    letterSpacing: 0.2,
+  },
 
-  // Chips
-  chipsScroll:   { maxHeight: 46, backgroundColor: '#0D1117' },
-  chipsContent:  { paddingHorizontal: spacing.md, gap: 8, alignItems: 'center', paddingVertical: 4 },
-  chip:          { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 12, paddingVertical: 8, borderRadius: radius.full, borderWidth: 1, borderColor: '#1E2835', backgroundColor: '#131A23' },
-  chipEmoji:     { fontSize: 13 },
-  chipLabel:     { color: '#8B98A5', fontSize: 12, fontWeight: fontWeight.bold },
+  // ── Composer ───────────────────────────────────────────────────
+  composerWrap: {
+    backgroundColor: colors.background,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    paddingBottom: Platform.OS === 'ios' ? spacing.lg : spacing.md,
+  },
+  composer: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    backgroundColor: colors.surface,
+    borderRadius: radius.xl,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingLeft: spacing.lg,
+    paddingRight: spacing.sm,
+    paddingVertical: spacing.sm,
+    gap: spacing.xs,
+    minHeight: 48,
+  },
+  textInput: {
+    flex: 1,
+    fontSize: type.small,
+    color: colors.ink,
+    maxHeight: 100,
+    paddingVertical: Platform.OS === 'ios' ? spacing.sm : 2,
+    lineHeight: 20,
+  },
+  composerBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: radius.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  composerBtnActive: {
+    backgroundColor: colors.emeraldSoft,
+  },
+  sendBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: radius.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.surface2,
+  },
+  sendBtnActive: {
+    backgroundColor: colors.emerald,
+  },
 
-  // Composer
-  composerWrap: { backgroundColor: '#0D1117', borderTopWidth: 1, borderTopColor: '#161D27', paddingBottom: spacing.lg, paddingTop: spacing.sm, paddingHorizontal: spacing.md },
-  composer:     { flexDirection: 'row', alignItems: 'flex-end', gap: 8, backgroundColor: '#131A23', borderRadius: 28, borderWidth: 1, borderColor: '#1E2835', paddingHorizontal: 6, paddingVertical: 6 },
-  micBtn:       { width: 40, height: 40, borderRadius: 20, backgroundColor: colors.emerald, alignItems: 'center', justifyContent: 'center', ...shadowLg },
-  textInput:    { flex: 1, minHeight: 38, maxHeight: 110, color: colors.ink, fontSize: type.body, fontWeight: fontWeight.medium, paddingHorizontal: 8, paddingVertical: 8 },
-  sendBtn:      { width: 38, height: 38, borderRadius: 19, backgroundColor: '#1E2835', alignItems: 'center', justifyContent: 'center' },
-  sendBtnActive: { backgroundColor: colors.emerald },
+  // ── Voice overlay ──────────────────────────────────────────────
+  voiceScreen: {
+    flex: 1,
+    backgroundColor: '#060B14',
+    // On Android with transparent Modal, we must fill the full screen
+    // including the area behind the status bar
+    ...Platform.select({ android: { position: 'absolute' as const, top: 0, left: 0, right: 0, bottom: 0 } }),
+  },
+  voiceTopBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: spacing.xxl,
+    paddingTop: spacing.lg,
+    paddingBottom: spacing.md,
+    gap: spacing.xs,
+  },
+  voiceTopTitle: {
+    fontSize: type.body,
+    fontWeight: fontWeight.bold,
+    color: colors.ink,
+    letterSpacing: 0.5,
+  },
+  voiceCancelX: {
+    position: 'absolute',
+    right: spacing.xxl,
+    top: spacing.lg,
+    width: 32,
+    height: 32,
+    borderRadius: radius.full,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  voiceCenter: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.lg,
+  },
+  voiceStatus: {
+    fontSize: type.section,
+    fontWeight: fontWeight.bold,
+    color: colors.ink,
+    letterSpacing: 0.3,
+  },
+  voiceSubtext: {
+    fontSize: type.small,
+    color: colors.inkSoft,
+  },
+  voiceWaveRow: {
+    alignItems: 'center',
+    paddingVertical: spacing.lg,
+  },
+  voiceControls: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.xxl,
+    paddingHorizontal: spacing.xxl,
+    paddingBottom: spacing.xxxl,
+  },
+  voiceCtrlBtn: {
+    width: 48,
+    height: 48,
+    borderRadius: radius.full,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.12)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  voiceMicBtn: {
+    width: 68,
+    height: 68,
+    borderRadius: radius.full,
+    backgroundColor: colors.emerald,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...shadow,
+  },
+  voiceTapHint: {
+    textAlign: 'center',
+    fontSize: type.micro,
+    color: colors.muted,
+    paddingBottom: spacing.md,
+  },
 
-  // Voice overlay
-  voiceScreen:   { flex: 1, backgroundColor: '#060B14' },
-  voiceTopBar:   { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing.xs, paddingTop: spacing.xl, paddingBottom: spacing.lg, position: 'relative' },
-  voiceTopTitle: { color: colors.ink, fontSize: type.body, fontWeight: fontWeight.black },
-  voiceCancelX:  { position: 'absolute', right: spacing.lg, padding: 8 },
-  voiceCenter:   { flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing.xl },
-  voiceStatus:   { color: colors.ink, fontSize: 26, fontWeight: fontWeight.black, textAlign: 'center', letterSpacing: -0.5 },
-  voiceSubtext:  { color: '#4A5568', fontSize: type.small, textAlign: 'center', marginTop: -spacing.md, paddingHorizontal: spacing.xxl },
-  voiceHint:     { color: '#2D3748', fontSize: 11, textAlign: 'center', paddingHorizontal: spacing.xxxl },
-  voiceWaveRow:  { flexDirection: 'row', alignItems: 'center', gap: spacing.md, justifyContent: 'center', paddingBottom: spacing.lg },
-  voiceWaveLabel: { color: colors.emerald, fontSize: type.small, fontWeight: fontWeight.black, letterSpacing: 0.5 },
-  voiceControls: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing.xxxl, paddingBottom: spacing.xl },
-  voiceCtrlBtn:  { width: 52, height: 52, borderRadius: 26, backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)', alignItems: 'center', justifyContent: 'center' },
-  voiceMicBtn:   { width: 72, height: 72, borderRadius: 36, backgroundColor: colors.emerald, alignItems: 'center', justifyContent: 'center', shadowColor: colors.emerald, shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.6, shadowRadius: 20, elevation: 12 },
-  voiceTapHint:  { color: '#2D3748', fontSize: 11, textAlign: 'center', paddingBottom: spacing.xxl, letterSpacing: 0.3 },
+  // ── Confirmation card ──────────────────────────────────────────
+  confirmCard: {
+    backgroundColor: colors.surface,
+    borderRadius: radius.xl,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.xxl,
+    gap: spacing.md,
+    marginHorizontal: spacing.xxl,
+    alignItems: 'center',
+  },
+  confirmTitle: {
+    fontSize: type.small,
+    color: colors.muted,
+    fontWeight: fontWeight.medium,
+  },
+  confirmTranscript: {
+    fontSize: type.body,
+    color: colors.ink,
+    fontWeight: fontWeight.semibold,
+    textAlign: 'center',
+    lineHeight: 24,
+  },
+  confirmHint: {
+    fontSize: type.small,
+    color: colors.inkSoft,
+  },
+  confirmActions: {
+    flexDirection: 'row',
+    gap: spacing.md,
+    marginTop: spacing.xs,
+  },
+  confirmRetry: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    borderRadius: radius.lg,
+    backgroundColor: colors.surface2,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  confirmRetryText: {
+    fontSize: type.small,
+    color: colors.inkSoft,
+    fontWeight: fontWeight.medium,
+  },
+  confirmOk: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    borderRadius: radius.lg,
+    backgroundColor: colors.emerald,
+  },
+  confirmOkText: {
+    fontSize: type.small,
+    color: colors.background,
+    fontWeight: fontWeight.bold,
+  },
 
-  // Transcript confirmation card
-  confirmCard: { backgroundColor: '#131A23', borderRadius: 20, borderWidth: 1, borderColor: '#1E2835', padding: spacing.xl, marginHorizontal: spacing.lg, gap: spacing.lg, ...shadow },
-  confirmTitle: { color: '#4A5568', fontSize: type.small, fontWeight: fontWeight.bold, textTransform: 'uppercase', letterSpacing: 0.8 },
-  confirmTranscript: { color: colors.ink, fontSize: 20, fontWeight: fontWeight.black, lineHeight: 28, letterSpacing: -0.3 },
-  confirmHint: { color: '#4A5568', fontSize: type.small },
-  confirmActions: { flexDirection: 'row', gap: spacing.md },
-  confirmRetry: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, paddingVertical: spacing.md, borderRadius: radius.md, borderWidth: 1, borderColor: '#1E2835' },
-  confirmRetryText: { color: colors.inkSoft, fontSize: type.small, fontWeight: fontWeight.bold },
-  confirmOk: { flex: 1.4, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing.sm, paddingVertical: spacing.md, borderRadius: radius.md, backgroundColor: colors.emerald },
-  confirmOkText: { color: colors.background, fontSize: type.small, fontWeight: fontWeight.black },
-
-  // Orb
-  orbWrap: { width: 220, height: 220, alignItems: 'center', justifyContent: 'center' },
-  orbRing3: { position: 'absolute', width: 280, height: 280, borderRadius: 140, backgroundColor: '#06B6D4' },
-  orbRing2: { position: 'absolute', width: 240, height: 240, borderRadius: 120, backgroundColor: '#8B5CF6' },
+  // ── Voice orb ──────────────────────────────────────────────────
+  orbWrap: {
+    width: 200,
+    height: 200,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  orbRing2: {
+    position: 'absolute',
+    width: 180,
+    height: 180,
+    borderRadius: 90,
+    borderWidth: 1,
+    borderColor: '#06B6D4',
+  },
+  orbRing3: {
+    position: 'absolute',
+    width: 220,
+    height: 220,
+    borderRadius: 110,
+    borderWidth: 1,
+    borderColor: '#8B5CF6',
+  },
 });

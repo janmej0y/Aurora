@@ -178,7 +178,11 @@ function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
       const { granted } = await requestRecordingPermissionsAsync();
       setPermissionGranted(granted);
       if (granted) {
-        await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
+        await setAudioModeAsync({
+          playsInSilentMode: true,
+          allowsRecording: true,          // iOS: enables .playAndRecord AVAudioSession
+          interruptionMode: 'doNotMix',   // Android: requests exclusive audio focus
+        });
       }
       return granted;
     } catch (err) {
@@ -216,7 +220,7 @@ function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
           isRecordingRef.current = false;
           setIsRecording(false);
           // Wait a tick for the recorder to write the file
-          await new Promise(r => setTimeout(r, 150));
+          await new Promise(r => setTimeout(r, 300));
           const uri = recorder.uri ?? null;
           onAutoStopRef.current(uri);
         } catch (err) {

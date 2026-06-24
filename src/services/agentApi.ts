@@ -23,12 +23,28 @@ async function getCurrentUserId(): Promise<string | null> {
   }
 }
 
+const CARD_PREFIX = '<<CARD:';
+const CARD_SUFFIX = '>>';
+
+function stripCardEncoding(content: string): string {
+  if (!content.startsWith(CARD_PREFIX)) return content;
+  const end = content.indexOf(CARD_SUFFIX, CARD_PREFIX.length);
+  if (end === -1) return content;
+  // Return just the natural language text that follows the card block
+  return content.slice(end + CARD_SUFFIX.length + 1).trim();
+}
+
 // ─── Build lean chat history for context window ───────────────────
 function buildChatHistory(messages: ChatMessage[]): ChatHistoryItem[] {
   return messages
     .slice(1)        // skip system seed message
     .slice(-12)
-    .map(m => ({ role: m.role, content: m.content }));
+    .map(m => ({
+      role: m.role,
+      // Strip <<CARD:...>> encoding from assistant messages so Gemini
+      // receives only the natural-language text, not raw JSON blobs.
+      content: m.role === 'assistant' ? stripCardEncoding(m.content) : m.content,
+    }));
 }
 
 // ─── Minimal context (bio only — no credentials ever sent) ───────

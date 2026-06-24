@@ -4,8 +4,15 @@
  * Web:    MediaRecorder + AnalyserNode silence detection
  * Native: expo-audio with manual stop + fallback timer
  *
- * onAutoStop(uri) is called when the timer fires.
- * stopRecording() returns a Promise<uri> for manual stop.
+ * Architecture:
+ *   - useVoiceRecorder() returns ONE recorder based on Platform.OS.
+ *   - The web and native hooks are defined separately and only the
+ *     relevant one is called — they are NOT both instantiated on every
+ *     render. This prevents `navigator` ReferenceErrors in the Android
+ *     APK environment and avoids double MediaRecorder resource allocation.
+ *
+ * onAutoStop(uri) is called when the 8s timer fires.
+ * stopRecording() returns Promise<uri | null> for manual stop.
  */
 
 import { Platform } from 'react-native';
@@ -17,11 +24,13 @@ import {
   useAudioRecorder,
 } from 'expo-audio';
 
-// Give users 8 seconds before auto-stopping — enough time to speak a full sentence
-const AUTO_STOP_MS   = 8000;
+const AUTO_STOP_MS    = 8000;
 const MAX_DURATION_MS = 60_000;
+// Extra flush time after recorder.stop() before reading recorder.uri.
+// 300 ms is safe on both fast and slow Android hardware.
+const FLUSH_MS = 300;
 
-// ─── Web ─────────────────────────────────────────────────────────
+// ─── Web recorder ────────────────────────────────────────────────────────────
 
 function useWebVoiceRecorder(onAutoStop: (uri: string | null) => void) {
   const [isRecording, setIsRecording] = useState(false);
@@ -91,7 +100,6 @@ function useWebVoiceRecorder(onAutoStop: (uri: string | null) => void) {
       mediaRecorderRef.current = mr;
       mr.start(100);
 
-      // Silence detection via AnalyserNode
       const audioCtx = new AudioContext();
       const source   = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
@@ -113,7 +121,6 @@ function useWebVoiceRecorder(onAutoStop: (uri: string | null) => void) {
         const rms = Math.sqrt(sumSq / buf.length);
         if (rms > 0.015) {
           hasSpeech = true;
-          // Reset silence timer on speech — only auto-stop after 3s of silence AFTER speech
           if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
           silenceTimerRef.current = setTimeout(triggerAutoStop, hasSpeech ? 3000 : AUTO_STOP_MS);
         }
@@ -151,7 +158,7 @@ function useWebVoiceRecorder(onAutoStop: (uri: string | null) => void) {
   return { isRecording, requestPermission, startRecording, stopRecording };
 }
 
-// ─── Native ───────────────────────────────────────────────────────
+// ─── Native recorder ─────────────────────────────────────────────────────────
 
 function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
   const [isRecording,       setIsRecording]       = useState(false);
@@ -159,14 +166,13 @@ function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
 
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
 
-  // Store callbacks in refs so timer callbacks always see the latest version
   const onAutoStopRef   = useRef(onAutoStopProp);
   onAutoStopRef.current = onAutoStopProp;
 
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const maxTimerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoStoppedRef  = useRef(false);
-  const isRecordingRef  = useRef(false); // mirror of state, readable inside async callbacks
+  const isRecordingRef  = useRef(false);
 
   const clearTimers = useCallback(() => {
     if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null; }
@@ -178,22 +184,26 @@ function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
       const { granted } = await requestRecordingPermissionsAsync();
       setPermissionGranted(granted);
       if (granted) {
+        // setAudioModeAsync: only pass properties that expo-audio v56 accepts on
+        // Android. interruptionMode is iOS-only in this SDK version — passing it
+        // on Android throws and requestPermission() returns false even though the
+        // OS granted microphone access, which silently breaks all voice recording.
         await setAudioModeAsync({
           playsInSilentMode: true,
-          allowsRecording: true,          // iOS: enables .playAndRecord AVAudioSession
-          interruptionMode: 'doNotMix',   // Android: requests exclusive audio focus
+          allowsRecording:   true,   // iOS only — silently ignored on Android (safe)
         });
       }
       return granted;
     } catch (err) {
-      console.warn('[VoiceRecorder] Permission error:', err);
-      return false;
+      console.warn('[VoiceRecorder] Permission/audio-mode error:', err);
+      // Even if setAudioModeAsync throws, the OS permission was still granted.
+      // Return the value we already stored rather than false.
+      return permissionGranted ?? false;
     }
-  }, []);
+  }, [permissionGranted]);
 
   const startRecording = useCallback(async (): Promise<boolean> => {
     try {
-      // Always check permission freshly
       if (!permissionGranted) {
         const ok = await requestPermission();
         if (!ok) return false;
@@ -202,15 +212,16 @@ function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
       clearTimers();
       autoStoppedRef.current = false;
 
-      // prepareToRecordAsync MUST be called before every record()
+      // prepareToRecordAsync MUST be called before every record() call.
+      // After stop(), the recorder is in a finished state and record() alone
+      // would throw without re-preparing.
       await recorder.prepareToRecordAsync();
       recorder.record();
       setIsRecording(true);
       isRecordingRef.current = true;
 
-      // Auto-stop: give user 8s to speak before we stop automatically
       const doAutoStop = async () => {
-        if (autoStoppedRef.current) return;
+        if (autoStoppedRef.current)  return;
         if (!isRecordingRef.current) return;
         autoStoppedRef.current = true;
         clearTimers();
@@ -219,8 +230,9 @@ function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
           await recorder.stop();
           isRecordingRef.current = false;
           setIsRecording(false);
-          // Wait a tick for the recorder to write the file
-          await new Promise(r => setTimeout(r, 300));
+          // Wait for the native layer to flush the .m4a file to disk.
+          // 300 ms is required on slower Android devices; 150 ms is too short.
+          await new Promise(r => setTimeout(r, FLUSH_MS));
           const uri = recorder.uri ?? null;
           onAutoStopRef.current(uri);
         } catch (err) {
@@ -233,7 +245,6 @@ function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
 
       silenceTimerRef.current = setTimeout(doAutoStop, AUTO_STOP_MS);
       maxTimerRef.current     = setTimeout(doAutoStop, MAX_DURATION_MS);
-
       return true;
     } catch (err) {
       console.warn('[VoiceRecorder] Native start failed:', err);
@@ -248,7 +259,7 @@ function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
     autoStoppedRef.current = true;
 
     if (!isRecordingRef.current) {
-      // Already stopped by auto-stop
+      // Already stopped by auto-stop timer — uri is already written
       return recorder.uri ?? null;
     }
 
@@ -256,8 +267,9 @@ function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
       await recorder.stop();
       isRecordingRef.current = false;
       setIsRecording(false);
-      // Small delay to let the native layer flush the file
-      await new Promise(r => setTimeout(r, 150));
+      // Same 300 ms flush as auto-stop — the manual path had 150 ms before,
+      // which was too short on slow Android devices causing recorder.uri = null.
+      await new Promise(r => setTimeout(r, FLUSH_MS));
       return recorder.uri ?? null;
     } catch (err) {
       console.warn('[VoiceRecorder] Manual stop failed:', err);
@@ -270,10 +282,16 @@ function useNativeVoiceRecorder(onAutoStopProp: (uri: string | null) => void) {
   return { isRecording, requestPermission, startRecording, stopRecording };
 }
 
-// ─── Unified export ───────────────────────────────────────────────
+// ─── Unified export ───────────────────────────────────────────────────────────
+// IMPORTANT: Only ONE hook is called per render — the one matching Platform.OS.
+// Previously both hooks were always called, which caused `navigator` reference
+// errors in the Android APK environment (native JS context has no `navigator`)
+// and wasted the native MediaRecorder resource. The conditional call below is
+// valid because Platform.OS is a compile-time constant that never changes.
 
 export function useVoiceRecorder(onAutoStop: (uri: string | null) => void) {
-  const web    = useWebVoiceRecorder(onAutoStop);
-  const native = useNativeVoiceRecorder(onAutoStop);
-  return Platform.OS === 'web' ? web : native;
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  if (Platform.OS === 'web') return useWebVoiceRecorder(onAutoStop);
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  return useNativeVoiceRecorder(onAutoStop);
 }

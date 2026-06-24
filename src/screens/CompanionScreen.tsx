@@ -66,7 +66,10 @@ function encodeCard(payload: RichMessagePayload): string {
 function decodeCard(content: string): { payload: RichMessagePayload; text: string } | null {
   if (!content.startsWith(CARD_PREFIX)) return null;
   try {
-    const end = content.indexOf(CARD_SUFFIX);
+    // Search for CARD_SUFFIX only after the prefix so we don't match ">>"
+    // that might appear inside a JSON string value.
+    const searchFrom = CARD_PREFIX.length;
+    const end = content.indexOf(CARD_SUFFIX, searchFrom);
     if (end === -1) return null;
     const json    = content.slice(CARD_PREFIX.length, end);
     const payload = JSON.parse(json) as RichMessagePayload;
@@ -646,8 +649,13 @@ export function CompanionScreen() {
     setServerReady(true);
     setBusy(false);
     // Only speak the text portion, not the card JSON
-    const textToSpeak = reply.length > 0 ? reply : '';
-    if (textToSpeak) speak(textToSpeak);
+    const textToSpeak = reply.trim();
+    if (textToSpeak) {
+      speak(textToSpeak);
+    } else {
+      // Nothing to speak — reset uiStatus so the "Thinking" pill disappears
+      setUiStatus('idle');
+    }
   }, [applyAgentActions, addAiMessage, speak]);
 
   // ── Send text ────────────────────────────────────────────────────
@@ -669,6 +677,7 @@ export function CompanionScreen() {
         ? 'The server is waking up from sleep — give it 30 seconds and try again.'
         : "I couldn't reach the server. Check your connection and try again.";
       addChatMessage({ role: 'assistant', content: fallback });
+      syncMessage('assistant', fallback);
       speak(fallback);
       setBusy(false);
       setUiStatus('idle');
@@ -714,7 +723,11 @@ export function CompanionScreen() {
         addChatMessage({ role: 'assistant', content: "I didn't catch that. Try speaking closer to the microphone, or type your message." });
         return;
       }
-      if (res.error === 'unclear' || res.error === 'low_confidence') { done(); return; }
+      if (res.error === 'unclear' || res.error === 'low_confidence') {
+        done();
+        addChatMessage({ role: 'assistant', content: "I heard you, but wasn't sure what you meant. Could you rephrase?" });
+        return;
+      }
 
       if (res.needsConfirmation && res.transcript) {
         setPendingTranscript(res.transcript);
@@ -723,7 +736,7 @@ export function CompanionScreen() {
           actions: res.actions ?? [],
           intent:  res.intent,
         };
-        setVoiceMode(true);
+        // voiceMode is already true — keep overlay open, switch to confirm state
         setUiStatus('confirming');
         setBusy(false);
         return;
@@ -748,6 +761,7 @@ export function CompanionScreen() {
         ? 'The server is waking up. Wait a moment and try again.'
         : "Couldn't reach the server. Check your connection.";
       addChatMessage({ role: 'assistant', content: fallback });
+      syncMessage('assistant', fallback);
       speak(fallback);
       setServerReady(false);
     }
@@ -772,8 +786,11 @@ export function CompanionScreen() {
 
   // ── Confirm transcript ───────────────────────────────────────────
   const confirmTranscript = useCallback(() => {
-    setVoiceMode(false);
     const pending = pendingResultRef.current;
+    setPendingTranscript('');
+    pendingResultRef.current = null;
+    setVoiceMode(false);
+    setBusy(true);
     if (pendingTranscript) {
       addChatMessage({ role: 'user', content: pendingTranscript });
       syncMessage('user', pendingTranscript);
@@ -784,8 +801,6 @@ export function CompanionScreen() {
       setBusy(false);
       setUiStatus('idle');
     }
-    setPendingTranscript('');
-    pendingResultRef.current = null;
   }, [pendingTranscript, addChatMessage, syncMessage, applyResult]);
 
   // ── Retry ────────────────────────────────────────────────────────
@@ -1026,14 +1041,15 @@ export function CompanionScreen() {
               editable={!busy}
             />
 
-            {/* Mic button */}
+            {/* Mic button — only allow stop when actually recording, not in
+                confirming/speaking states where voiceMode=true but mic is idle */}
             <TouchableOpacity
               style={[cs.composerBtn, isRecording && cs.composerBtnActive]}
-              onPress={voiceMode ? stopRecording : startRecording}
+              onPress={isRecording ? stopRecording : startRecording}
               disabled={busy && !isRecording}
               activeOpacity={0.75}
             >
-              <Mic size={18} color={voiceMode ? colors.emerald : colors.inkSoft} strokeWidth={2.5} />
+              <Mic size={18} color={isRecording ? colors.emerald : colors.inkSoft} strokeWidth={2.5} />
             </TouchableOpacity>
 
             {/* Send button */}
